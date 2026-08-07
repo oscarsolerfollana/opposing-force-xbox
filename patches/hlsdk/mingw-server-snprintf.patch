@@ -1,0 +1,19 @@
+diff --git a/dlls/CMakeLists.txt b/dlls/CMakeLists.txt
+index 45402980..cb08ef46 100644
+--- a/dlls/CMakeLists.txt
++++ b/dlls/CMakeLists.txt
+@@ -31,7 +31,13 @@ if(NOT MSVC)
+ 	add_compile_options(-Wno-invalid-offsetof) # GCC/Clang flag
+ 	add_compile_options(-fvisibility=hidden) # GCC/Clang flag
+ 	add_definitions(-D_LINUX) # It seems enough for all non-Win32 systems
+-	add_definitions(-Dstricmp=strcasecmp -Dstrnicmp=strncasecmp -D_snprintf=snprintf -D_vsnprintf=vsnprintf )
++	add_definitions(-Dstricmp=strcasecmp -Dstrnicmp=strncasecmp)
++	# MinGW's stdio.h declares snprintf/vsnprintf with C++ linkage, so redefining
++	# _snprintf -> snprintf clashes with the extern "C" decls pulled in by extdll.h.
++	# cl_dll/CMakeLists.txt already guards this the same way.
++	if(NOT MINGW)
++		add_definitions(-D_snprintf=snprintf -D_vsnprintf=vsnprintf)
++	endif()
+ 	if(CMAKE_BUILD_TYPE MATCHES "Release"
+ 		OR (CMAKE_BUILD_TYPE MATCHES "RelWithDebInfo"
+ 		AND CMAKE_SYSTEM_NAME STREQUAL "Android"))

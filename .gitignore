@@ -1,0 +1,39 @@
+# Game trees: contain assets from your own legal copy of the games.
+# Never commit these.
+game/
+game-*/
+
+# Save games and screenshots
+*.sav
+*.HL1
+*.HL2
+*.HL3
+*.bmp
+
+# Build artefacts
+build/
+build-*/
+*.o
+*.so
+*.dll
+*.exe
+*.a
+*.lib
+*.obj
+.waf3-*
+.waf-*
+.lock-waf*
+
+# Downloads / scratch
+downloads/
+research/
+*.7z
+*.tar.gz
+*.zip
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

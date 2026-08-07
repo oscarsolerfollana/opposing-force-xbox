@@ -1,0 +1,21 @@
+diff --git a/wscript b/wscript
+index b1cd343b..a8ed179a 100644
+--- a/wscript
++++ b/wscript
+@@ -296,6 +296,16 @@ def configure(conf):
+ 	enforce_pic = conf.env.DEST_OS != 'psvita' and not conf.env.STATIC_LINKING
+ 	conf.check_pic(enforce_pic)
+ 
++	# toolchains configured with --enable-default-pie keep generating position
++	# independent code even with -fno-PIC. On i386 that emits PC-thunks into COMDAT
++	# groups, which don't survive the `ld -r` and `objcopy -G` steps used to build
++	# relocatable libraries, making the final link fail on discarded sections
++	if conf.env.STATIC_LINKING:
++		if conf.check_cc(cflags=['-fno-pie'], linkflags=['-no-pie'], msg='Checking for -fno-pie', mandatory=False):
++			conf.env.append_unique('CFLAGS', '-fno-pie')
++			conf.env.append_unique('CXXFLAGS', '-fno-pie')
++			conf.env.append_unique('LINKFLAGS', '-no-pie')
++
+ 	# NOTE: We restrict 64-bit builds ONLY for Win/Linux running on Intel architecture
+ 	# Because compatibility with original GoldSrc
+ 	# NOTE: Since modern OSX (since Catalina) don't support 32-bit applications, there is no point

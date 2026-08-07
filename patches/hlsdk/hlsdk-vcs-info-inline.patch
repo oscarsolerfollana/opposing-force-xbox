@@ -1,0 +1,43 @@
+diff --git a/cl_dll/wscript b/cl_dll/wscript
+index 99bd7ea5..4a38cb3e 100644
+--- a/cl_dll/wscript
++++ b/cl_dll/wscript
+@@ -40,7 +40,7 @@ def configure(conf):
+ 			conf.fatal('VGUI was enabled but VGUI cannot be used')
+ 
+ def build(bld):
+-	libs = ['vcs_info']
++	libs = []
+ 	defines = ['CLIENT_DLL']
+ 	defines += bld.env.EXPORT_DEFINES_LIST
+ 	includes = ['.',
+@@ -79,6 +79,7 @@ def build(bld):
+ 	source += bld.path.parent.ant_glob('game_shared/*.cpp', excl=excluded_files)
+ 	source += bld.path.parent.ant_glob([
+ 		'public/safe_snprintf.c',
++		'game_shared/vcs_info.c',
+ 		'pm_shared/*.c',
+ 		'dlls/crossbow.cpp',
+ 		'dlls/crowbar.cpp',
+diff --git a/dlls/wscript b/dlls/wscript
+index 71b06c49..060d2bd9 100644
+--- a/dlls/wscript
++++ b/dlls/wscript
+@@ -23,7 +23,8 @@ def build(bld):
+ 	excluded_files = ['mpstubb.cpp', 'stats.cpp', 'Wxdebug.cpp', 'gearbox/gearbox_client.cpp']
+ 
+ 	source = bld.path.ant_glob('**/*.cpp', excl=excluded_files)
+-	source += bld.path.parent.ant_glob(['pm_shared/*.c', 'public/safe_snprintf.c'])
++	source += bld.path.parent.ant_glob(['pm_shared/*.c', 'public/safe_snprintf.c',
++		'game_shared/vcs_info.c'])
+ 
+ 	defines = bld.env.EXPORT_DEFINES_LIST
+ 	if 'HAVE_STRLCPY=1' not in defines:
+@@ -69,7 +70,6 @@ def build(bld):
+ 		features = 'c cxx',
+ 		includes = includes,
+ 		defines  = defines,
+-		use      = 'vcs_info',
+ 		install_path = install_path,
+ 		idx = bld.get_taskgen_count()
+ 	)

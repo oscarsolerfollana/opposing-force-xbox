@@ -1,0 +1,25 @@
+diff --git a/scripts/waifulib/xshlib.py b/scripts/waifulib/xshlib.py
+index 72e673a..1ef66b4 100644
+--- a/scripts/waifulib/xshlib.py
++++ b/scripts/waifulib/xshlib.py
+@@ -55,7 +55,9 @@ class xshlib(ccroot.link_task):
+ 
+ 		self.set_outputs(target_unstripped)
+ 		self.generator.objcopy_task= self.generator.create_task('objcopy_relocatable_lib', target_unstripped, target_stripped)
+-		self.generator.objcopy_task.env['NAME'] = target
++		# the exports table is named after the task generator (see write_export_list
++		# and write_libraries_list), which is not always the output target name
++		self.generator.objcopy_task.env['NAME'] = self.generator.name
+ 
+ class cprogram_static(c.cprogram):
+ 	"build static c program"
+@@ -112,4 +114,8 @@ def apply_static(main, *reloc):
+ 			write_libraries_list(self.path.get_bld().make_node('generated_library_tables.h'))
+ 
+ 			for t in reloc:
+-				self.source += [self.bld.get_tgen_by_name(t).objcopy_task.outputs[0]]
++				tg = self.bld.get_tgen_by_name(t)
++				# the relocatable object is created by the target's own post();
++				# force it, as we may be posted before it. post() is idempotent
++				tg.post()
++				self.source += [tg.objcopy_task.outputs[0]]

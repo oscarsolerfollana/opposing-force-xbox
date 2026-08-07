@@ -1,0 +1,26 @@
+diff --git a/engine/platform/posix/lib_posix.c b/engine/platform/posix/lib_posix.c
+index e624a31..9581e8f 100644
+--- a/engine/platform/posix/lib_posix.c
++++ b/engine/platform/posix/lib_posix.c
+@@ -147,15 +147,18 @@ void *COM_FunctionFromName( void *hInstance, const char *pName )
+ 
+ const char *COM_NameForFunction( void *hInstance, void *function )
+ {
++#ifdef XASH_ALLOW_SAVERESTORE_OFFSETS
++	// offsets take priority when explicitly enabled: the point of the define is to
++	// not depend on symbol names at all. Upstream only reaches this as a fallback
++	// for when dladdr() fails, which never happens with a dynamic game library
++	return COM_OffsetNameForFunction( function );
++#else
+ 	// NOTE: dladdr() is a glibc extension
+ 	Dl_info info = {0};
+ 	int ret = dladdr( (void*)function, &info );
+ 	if( ret && info.dli_sname )
+ 		return COM_GetPlatformNeutralName( info.dli_sname );
+ 
+-#ifdef XASH_ALLOW_SAVERESTORE_OFFSETS
+-	return COM_OffsetNameForFunction( function );
+-#else
+ 	return NULL;
+ #endif
+ }
