@@ -28,23 +28,42 @@ offset tokens, the engine closed, the save reloaded in a fresh process, with zer
 pointer-resolution failures and a verified round-trip of the restored pointers.
 Details in `BUILD.md` §15.
 
-**Phase 2 — Xbox: toolchain decision made, implementation not started.**
+**Phase 2 — Xbox: toolchain working, game libraries building, engine blocked.**
 
-The chosen route is **[nxdk](https://github.com/XboxDev/nxdk)**, starting from
-[`maximqaxd/xash3d-fwgs_xbox`](https://github.com/maximqaxd/xash3d-fwgs_xbox) — an
-in-progress port of modern Xash3D FWGS to the original Xbox that uses the same
-codebase and the same waf build system as the PC work above. Notably, nxdk provides
-`LoadLibraryA`, so game libraries load dynamically on Xbox and the static-linking dead
-end does not apply.
+| What | Result |
+|---|---|
+| [nxdk](https://github.com/XboxDev/nxdk) toolchain installed and verified | ✅ sample builds to a valid `.xbe` + ISO |
+| [pbgl](https://github.com/fgsfdsfgs/pbgl) (OpenGL 1.x over pbkit) built | ✅ `libpbgl.lib`, 157 GL symbols |
+| **Op4 game libraries cross-compiled with nxdk** | ✅ **231/231 sources, 0 unresolved symbols** — `opfor.dll` (1.59 MB) and `client.dll` (437 KB), PE32 i386, 660 + 71 exports |
+| Fork [`maximqaxd/xash3d-fwgs_xbox`](https://github.com/maximqaxd/xash3d-fwgs_xbox) | ❌ does not configure — two files its own build references are absent from the repository |
+| Loading those `.dll`s on the Xbox | ❌ **blocked** — nxdk has no PE loader |
 
-The alternative, [Half-LifeX](https://github.com/brentdc-nz/Half-LifeX), was evaluated
-and rejected as a base: it requires Visual Studio .NET 2003 plus Microsoft's
+The route is **nxdk**, and the game side of it works: the toolchain is clang targeting
+`i386-pc-windows-msvc`, so the C++ ABI is MSVC's — the same one the original GoldSrc
+gamedlls use. The game libraries compile with a small compatibility layer and no
+modification to any hlsdk source file (`patches/hlsdk/hlsdk-nxdk-gamedll.patch`).
+
+A useful side effect: the server library exports the 660 `Think`/`Touch`/`Use` handlers
+that hlsdk marks with `EXPORT`, so `COM_FunctionFromName`/`NameForFunction` resolve by
+name exactly as they do on Windows. That means this route needs neither Source-style
+datamaps nor even the offset-based save/restore validated in Phase 1 — §15 becomes a
+safety net rather than a requirement.
+
+**The blocker is in the engine, not the game.** §16 chose nxdk partly on the claim that
+it provides a working `LoadLibraryA`. That claim is wrong: nxdk's `LoadLibraryExA` is a
+stub that always fails, and there is no PE loader anywhere in `nxdk/lib/`. The fork
+compounds this by disabling Xash's own in-memory PE loader on Xbox and relying on that
+stub. The likely way out is to re-enable Xash's `MemoryLoadLibrary` (464 lines, already
+present) and supply the four Win32 calls nxdk lacks. Details and alternatives in §18.6–18.7.
+
+The alternative base, [Half-LifeX](https://github.com/brentdc-nz/Half-LifeX), was
+evaluated and rejected: it requires Visual Studio .NET 2003 plus Microsoft's
 non-distributable Xbox XDK, is built on the older Xash3D 0.99 lineage, carries its own
 11k-line OpenGL-over-D3D8 layer, and would require re-implementing save/restore as
 hand-written Source-style datamaps across the game code. It remains an excellent
 reference for the unsolved problem: fitting in 64 MB of RAM.
 
-Full comparison in `BUILD.md` §16.
+Full comparison in `BUILD.md` §16; Phase 2 work in §17 and §18.
 
 ---
 
@@ -72,6 +91,9 @@ Everything is in **`BUILD.md`**. In short:
 3. §6 — copy `valve/` and `gearbox/` from **your own legal copy** of the games.
 4. §7 — launch with `-game gearbox`.
 5. §11 — the local patches and how to reapply them after a `git pull`.
+
+For the Xbox side, §17 covers installing and verifying nxdk and pbgl, and §18 covers
+building the Op4 game libraries with it (`./waf configure --nxdk && ./waf build`).
 
 The patches are not upstreamed. §11 explains what each one does and whether it is
 mandatory or only needed for a specific experiment.

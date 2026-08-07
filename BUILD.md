@@ -2812,3 +2812,561 @@ Barato y decisivo, en este orden:
 Half-LifeX se queda clonado en `~/opposing-force-x/research/Half-LifeX` como
 referencia para el punto 4 — su gestión de memoria y sus recortes son el mejor material
 que hay sobre el tema.
+
+---
+
+## 17. Paso 2 — nxdk instalado, fork bloqueado
+
+**Resumen: el toolchain funciona; el fork no compila porque está publicado incompleto.**
+
+| Pieza | Estado |
+|---|---|
+| nxdk instalado y verificado | ✅ **funciona** — sample compilado a `.xbe` válido + ISO |
+| pbgl compilado | ✅ **funciona** — `libpbgl.lib`, 157 símbolos GL |
+| Fork `maximqaxd/xash3d-fwgs_xbox` | ❌ **no compila**: le faltan 2 ficheros que su propio build referencia |
+| xemu | ⏸️ no instalado — decisión y requisitos en §17.4 |
+| Op4 (gearbox) | ⏸️ no alcanzado |
+
+### 17.1 nxdk — instalado y verificado
+
+Prerrequisitos (Ubuntu 22.04, coinciden con el wiki oficial):
+
+```bash
+apt install build-essential cmake flex bison clang lld git llvm
+```
+
+Instalados: clang 14.0.0, LLD 14.0.0, bison 3.8.2, flex 2.6.4, cmake 3.22.1.
+El `bin/activate` de nxdk avisa si clang < 10 o si está en el rango 19.x–20.1.2
+(bug conocido de LLVM con optimizaciones). La 14 está fuera de ambos.
+
+```bash
+mkdir -p /opt/toolchains/xbox            # ruta que el fork espera hardcodeada
+cd /opt/toolchains/xbox
+git clone --recursive https://github.com/XboxDev/nxdk.git
+```
+
+HEAD: `29638d0` (5-jun-2026). Submódulos: SDL2, SDL2_image, SDL_ttf, lwip, pdclib,
+libcxx, zlib, libjpeg-turbo, libpng, libusbohci, extract-xiso.
+
+**Verificación con un sample:**
+
+```bash
+export NXDK_DIR=/opt/toolchains/xbox/nxdk
+export PATH="$NXDK_DIR/bin:$PATH"       # imprescindible: es lo que hace bin/activate
+cd $NXDK_DIR/samples/hello && make
+```
+
+Resultado:
+
+```
+bin/default.xbe        110.592 bytes
+magic                  XBEH            <- cabecera XBE valida
+nxdk sample - hello.iso 655.360 bytes  <- ISO Xbox conteniendo /default.xbe
+```
+
+**El toolchain está sano.**
+
+> Nota: la primera vez falló con `nxdk-cc: No such file or directory`. Definir
+> `NXDK_DIR` no basta; hay que añadir `$NXDK_DIR/bin` al `PATH`.
+
+### 17.2 pbgl — compilado
+
+```bash
+cd /opt/toolchains/xbox
+git clone https://github.com/fgsfdsfgs/pbgl.git
+```
+
+HEAD: `017ab17` (20-may-2026).
+
+pbgl **no trae Makefile propio**: se integra en el Makefile nxdk del proyecto que lo
+usa (vía `config_pbgl.make`) o se compila con CMake. Pero el fork enlaza
+`/opt/toolchains/xbox/pbgl/libpbgl.lib` **directamente**, así que hubo que producir la
+librería suelta. Escribí este envoltorio mínimo:
+
+```make
+# /opt/toolchains/xbox/pbgl/Makefile.standalone
+NXDK_DIR ?= /opt/toolchains/xbox/nxdk
+
+include $(NXDK_DIR)/Makefile
+include /opt/toolchains/xbox/pbgl/config_pbgl.make
+
+.PHONY: pbgl
+pbgl: $(PBGL_LIB)
+```
+
+```bash
+make -f Makefile.standalone pbgl
+```
+
+Resultado: `libpbgl.lib`, **130.050 bytes**, 16 objetos, **157 símbolos GL**.
+
+> Dos trampas: (a) el `include` de `config_pbgl.make` debe llevar **ruta absoluta**,
+> porque tras incluir el Makefile de nxdk `$(lastword $(MAKEFILE_LIST))` ya apunta a
+> otro sitio; (b) hay que pedir el target `$(PBGL_LIB)` por su nombre real
+> (`.../pbgl//libpbgl.lib`, con doble barra) o vía un target `.PHONY`, porque si
+> escribes la ruta "limpia" a mano, make casa con una regla genérica `%.lib` y
+> produce una librería vacía sin quejarse.
+
+### 17.3 El fork — BLOQUEADO: faltan ficheros en el repositorio
+
+```bash
+cd ~/opposing-force-x/research/xash3d-fwgs_xbox
+git submodule update --init --recursive
+NXDK_DIR=/opt/toolchains/xbox/nxdk ./waf configure --xbox
+```
+
+```
+ModuleNotFoundError: No module named 'xbox'
+  File ".../wscript", line 131, in options
+    opt.load('... subproject ninja xbox')
+```
+
+**Faltan dos ficheros que el propio build referencia:**
+
+| Fichero | Lo referencia | ¿Existe? | ¿Estuvo alguna vez? |
+|---|---|---|---|
+| `scripts/waifulib/xbox.py` | `wscript:131` (`opt.load`) y `wscript:237` (`conf.load`) | **NO** | **No.** `git log --all --diff-filter=A -- '*xbox.py'` no devuelve nada |
+| `engine/platform/xbox/xbox_sbrk.c` | `engine/wscript:232` | **NO** | No |
+
+Lo que sí está en `engine/platform/xbox/`: `sys_xbox.c` (3.858 B), `vid_xbox.c`
+(11.355 B), `net_xbox.h` (2.758 B). Nada más.
+
+Comprobé además que **no hay otra rama ni tag del fork con trabajo Xbox**: el listado
+de refs remotas es el heredado de FWGS upstream, y solo `master` lleva los 6 commits
+de Xbox.
+
+**Diagnóstico:** el fork está publicado incompleto. No es que falle a mitad de
+compilación por un bug: es que **el primer paso, el `configure`, muere antes de
+empezar** porque el autor nunca commiteó el módulo waf de su propia plataforma.
+
+**Qué sería `xbox.py`** — solo se puede inferir. No aparece llamado por nombre en
+ningún sitio (`conf.xbox_*`, `bld.xbox_*`: cero coincidencias), así que su API no se
+deduce del resto del árbol. Por analogía con `psvita.py` y `nswitch.py`, que sí están
+en el repo y hacen exactamente eso para sus plataformas, lo más probable es que
+proporcione **la tarea de empaquetado del ejecutable final** (PE → `.xbe` con `cxbe`,
+y opcionalmente el ISO con `extract-xiso`). Pero es una inferencia, no un hecho.
+
+**No lo escribo yo**, por la condición de parada: reconstruir el módulo de plataforma
+que falta es escribir la pieza, no compilar el fork tal cual.
+
+### 17.4 xemu — dónde instalarlo y qué ficheros pide
+
+**Recomendación: instálalo en Windows, no en WSL.**
+
+Motivos: xemu necesita aceleración gráfica real (OpenGL/Vulkan) contra la GPU; bajo
+WSLg irías a través de una capa de traducción que no está soportada ni probada por el
+proyecto. Además el mando se pasa mucho más limpio en Windows, y ya tienes ahí el
+entorno de §12 para lanzar cosas. En WSL solo tiene sentido si algún día quieres
+automatizar pruebas sin ventana, que no es el caso ahora.
+
+**Ficheros que exige xemu** (tres, y no los genera):
+
+| Fichero | Qué es |
+|---|---|
+| **MCPX Boot ROM** (`mcpx_1.0.bin`) | El bootloader del sistema |
+| **Flash ROM / BIOS** | Firmware del sistema. Debe ser una versión *debug* o una retail modificada |
+| **Imagen de disco duro** | Almacenamiento del dashboard y los juegos |
+
+**Cómo obtenerlos legalmente.** La documentación de xemu es explícita:
+
+> *"The only legal way to acquire these files is to dump them from your real, physical
+> Xbox."*
+
+Es decir: **hay que volcarlos de tu propia consola física.** El proyecto declara que no
+respalda la piratería y no enlaza material con copyright. **No he descargado ninguno de
+estos ficheros ni voy a hacerlo**, y no debemos usar sitios de dumps.
+
+Excepción parcial: para el **disco duro**, el propio proyecto xemu ofrece una imagen de
+8 GB pre-construida y descargable, que contiene únicamente un dashboard sin firmar con
+funcionalidad básica — no el dashboard oficial de Xbox. Esa sí es de origen legítimo.
+También existen herramientas de terceros (XboxHDM, FATXplorer) para crear imágenes
+propias, no mantenidas por xemu.
+
+Referencia: <https://xemu.app/docs/required-files/>
+
+### 17.5 Qué falta para intentar gearbox
+
+En orden, y el primero es el que bloquea todo:
+
+1. **Resolver los ficheros que faltan en el fork.** Tres caminos, de mejor a peor:
+   - **Preguntar al autor.** Abrir un issue en el repo pidiendo `xbox.py` y
+     `xbox_sbrk.c`. Es un fork de 1 estrella y un autor; lo más probable es que sea un
+     descuido al commitear y que los tenga en local. **Es la vía barata y la que
+     recomiendo.**
+   - Escribir `xbox.py` nosotros tomando `psvita.py`/`nswitch.py` como plantilla, y
+     `xbox_sbrk.c` como un `sbrk` mínimo sobre el heap de nxdk. Factible, pero es
+     asumir el mantenimiento de la capa de plataforma de otro.
+   - Buscar si el autor lo publicó en otro sitio (su port de Dreamcast, algún gist).
+2. Con el fork compilando: producir el `.xbe` y montar la estructura de disco.
+3. Probar en xemu con los ficheros de §17.4, que tú tienes que volcar de tu consola.
+4. Solo entonces: cross-compilar `hlsdk-portable` rama `opfor` con nxdk y ver si
+   `LoadLibraryA` carga `opfor.dll` en Xbox — la hipótesis central de §16.
+
+### 17.6 Estado real del fork, sin adornos
+
+En §16.3 escribí que el fork *"toca `sv_save.c`, `filesystem.c` y `lib_win.c`, señal de
+que llegó a problemas reales de ejecución, no es un esqueleto de compilación"*. Eso
+sigue siendo cierto del **código**, y también lo es que **el repositorio publicado no
+compila**. Las dos cosas conviven: el autor tiene trabajo real hecho, pero lo que subió
+no basta para reproducirlo.
+
+Corrijo por tanto la valoración de §16.6, donde puse *"El fork puede no compilar ni
+arrancar — no lo he probado"* como riesgo: **ya está comprobado y no compila.** Lo que
+no sabemos todavía es si arrancaría una vez completado.
+
+Esto **no invalida la decisión de §16** de ir por nxdk: el toolchain funciona, pbgl
+funciona, y la arquitectura (FWGS moderno + waf + carga dinámica) sigue siendo la
+correcta. Lo que cambia es que la vía no es "clonar y compilar", sino "clonar,
+conseguir las dos piezas que faltan, y compilar".
+
+### 17.7 Estado del entorno tras esta sesión
+
+```
+/opt/toolchains/xbox/
+├── nxdk/     29638d0, submódulos completos, sample verificado -> .xbe valido
+└── pbgl/     017ab17, libpbgl.lib compilada (130 KB, 157 simbolos GL)
+                 + Makefile.standalone (nuestro, para la build suelta)
+
+~/opposing-force-x/research/
+├── Half-LifeX/          referencia de §16
+└── xash3d-fwgs_xbox/    submódulos inicializados; NO configura
+```
+
+Paquetes añadidos al sistema: `clang lld llvm bison flex`.
+`game/`, `game-win32/` y `game-offsets/` intactos.
+
+---
+
+## 18. Paso 2b — El gamedll de Op4 compilado con nxdk (sesión paralela)
+
+**Resumen: el gamedll compila y enlaza al 100 % con nxdk. Salen `opfor.dll` (1,52 MB)
+y `client.dll` (427 KB), PE32 i386 válidos, con la tabla de exports que el motor
+necesita. Y en el camino aparece el problema serio del port, que no está en el juego
+sino en el motor: nxdk no tiene cargador de DLLs.**
+
+Esta sesión no dependía del fork bloqueado de §17. Objetivo: censo de problemas al
+cross-compilar `hlsdk-portable` rama `opfor` con el toolchain nxdk verificado en §17.1.
+
+| | Resultado |
+|---|---|
+| Fuentes que compilan, sin tocar nada | **222/231 (96 %)** |
+| Fuentes que compilan con la capa de compatibilidad | **231/231 (100 %)**, a `-O0` y a `-O2` |
+| Símbolos sin resolver al enlazar, antes del shim | 5 |
+| Símbolos sin resolver, después | **0** |
+| `./waf configure --nxdk && ./waf build` | ✅ funciona de punta a punta |
+| Cargar ese `.dll` en la Xbox | ❌ **imposible hoy** — §18.6 |
+
+### 18.1 Precedente en hlsdk: sí lo hay, y es exactamente el patrón a imitar
+
+`hlsdk-portable` ya soporta **dos consolas con toolchain propio**, y las dos siguen la
+misma estructura:
+
+| Plataforma | Variable de entorno | Clase en `xcompile.py` | `DEST_OS` |
+|---|---|---|---|
+| Nintendo Switch | `DEVKITPRO` | `NintendoSwitch` | `nswitch` |
+| PlayStation Vita | `VITASDK` | `PSVita` | `psvita` |
+
+El patrón, en `scripts/waifulib/xcompile.py`:
+
+1. Una constante `<PLAT>_ENVVARS` con la variable que apunta al SDK.
+2. Una clase que valida que el SDK existe y expone `cc() cxx() ar() strip()
+   cflags() linkflags() ldflags()`.
+3. Una opción `--<plat>` en `options()`.
+4. Una rama en `configure()` que mete esos comandos en `conf.environ` y fija
+   `conf.env.DEST_OS`.
+5. Si el compilador define una macro que delata la plataforma, se registra en
+   `MACRO_TO_DESTOS` **antes** de la tabla estándar de waf.
+
+Y en el `wscript` raíz, ramas por `DEST_OS` para los detalles (líneas 128-137: la Switch
+quita `-Wl,--no-undefined` y enlaza sin libc estándar; la Vita añade `-fPIC` y
+`--unresolved-symbols=ignore-all`).
+
+No hay precedente de Dreamcast ni de Xbox. El CI (`.github/workflows/build.yml`) solo
+cubre Linux y Windows vía CMake: **el soporte de consolas es solo-wscript y no está
+probado por CI**, ni el de ellos ni el nuestro.
+
+He seguido ese patrón al pie de la letra. Ver §18.4.
+
+### 18.2 Qué es realmente el toolchain nxdk, y por qué eso ayuda
+
+```
+$ nxdk-cxx --version
+Ubuntu clang version 14.0.0-1ubuntu1.1
+Target: i386-pc-windows-msvc
+```
+
+Esto es **la mejor noticia de la sesión**. `nxdk-cc`/`nxdk-cxx` no son un cross-GCC:
+son clang apuntando a `i386-pc-win32`, con `lld-link` de enlazador. Consecuencias:
+
+- **La ABI de C++ es la de MSVC** — la misma con la que se construyeron los gamedll
+  originales de GoldSrc. El *name mangling*, el `this` en `ecx`, el layout de vtables:
+  todo coincide con el `opfor.dll` retail.
+- El código toma las rutas `_WIN32` de hlsdk, no las de Linux. Que es lo correcto.
+- La libc es **pdclib** (C99/C11 estricta) más un shim Win32 pequeño, ambos
+  *freestanding*: `-ffreestanding -nostdlib -fno-builtin`.
+
+### 18.3 El censo, sin tocar una sola línea de hlsdk
+
+Compilación fichero a fichero (`nxdk-census/census.sh`), replicando los `ant_glob` de
+`dlls/wscript` y `cl_dll/wscript`:
+
+| | Compilan | Total | % |
+|---|---|---|---|
+| server (opfor) | 149 | 153 | 97 % |
+| client | 73 | 78 | 93 % |
+| **total** | **222** | **231** | **96 %** |
+
+**Los nueve fallos, clasificados:**
+
+| # | Fallo | Ficheros | Clase | Por qué |
+|---|---|---|---|---|
+| 1 | `unknown type name 'va_list'` | `dlls/util.cpp`, `cl_dll/hl/hl_weapons.cpp` | **trivial** | En MSVC `va_list` llega por `<vadefs.h>` arrastrado por `<windows.h>`; el `windows.h` reducido de nxdk no lo hace. pdclib sí trae `<stdarg.h>` completo |
+| 2 | `DLL_PROCESS_ATTACH` / `_DETACH` no declarados | `dlls/h_export.cpp` | **trivial** | El `winnt.h` de nxdk no los define porque nxdk no tiene cargador: nadie llama nunca a `DllMain` |
+| 3 | `'sys/types.h' file not found` | `external/openbsd/strlcpy.c`, `strlcat.c` (×2, server y client) | **trivial** | pdclib no implementa la jerarquía `<sys/*>` de POSIX. De ella estos ficheros solo usan `size_t` |
+| 4 | `'memory.h' file not found` | `cl_dll/entity.cpp` | **trivial** | Cabecera histórica de MSVC; C89 movió su contenido a `<string.h>` |
+| 5 | `POINT`, `SetCursorPos`, `GetCursorPos` no declarados | `cl_dll/in_camera.cpp` | **mediano** | API de cursor de escritorio. En Xbox no hay puntero que leer ni recentrar |
+
+**Ningún fallo serio en la compilación.** No hay una sola asunción estructural del
+código del juego que rompa contra nxdk. Los 231 ficheros son, salvo esas cinco cosas,
+portables tal cual.
+
+> Verificado también a `-O2`: 231/231. El aviso de §17.1 sobre bugs de optimización de
+> LLVM aplica al rango 19.x–20.1.2; estamos en clang 14.
+
+### 18.4 Los parches (todos triviales y medianos; ninguno serio)
+
+Dos bloques. **Ninguno toca un fuente de hlsdk** — el árbol sigue produciendo los
+builds i386 y win32 de §12/§15 sin cambios (comprobado, §18.10).
+
+**(a) Capa de compatibilidad — `external/nxdk/`, cuatro ficheros nuevos.**
+Sigue el idiom que hlsdk ya usa en `external/openbsd/` para suplir funciones de libc
+ausentes. Se inyecta con `-include`, así que ningún `.cpp` del juego se modifica.
+
+| Fichero | Cubre |
+|---|---|
+| `nxdk_compat.h` | fallos 1, 2 y 5 del censo |
+| `sys/types.h` | fallo 3 |
+| `memory.h` | fallo 4 |
+| `nxdk_runtime.cpp` | los dos huecos de enlazado de §18.5 |
+
+**(b) Integración en waf — parche de 169 líneas**, en
+`~/opposing-force-x/hlsdk-nxdk-gamedll.patch`:
+
+| Fichero | Cambio |
+|---|---|
+| `scripts/waifulib/xcompile.py` | `NXDK_ENVVARS`, clase `Nxdk`, opción `--nxdk`, rama en `configure()`, y `'NXDK'` en `MACRO_TO_DESTOS`. Calcado de `PSVita`/`NintendoSwitch` |
+| `wscript` | Rama `DEST_OS == 'nxdk'`: patrones de librería PE, `IMPLIB_ST`, flags de `llvm-lib`, `-I`/`-include` de la capa compat, sin `-fPIC`, sin `libm`/`user32`, y sin definir `_LINUX` |
+| `dlls/wscript` | Añade `nxdk_runtime.cpp` y exporta `GiveFnptrsToDll` sin decorar |
+| `cl_dll/wscript` | Añade `nxdk_runtime.cpp` |
+
+Cinco detalles que costaron una iteración cada uno, por si vuelven a aparecer:
+
+1. **`DEST_OS` se recalcula.** Fijar `conf.env.DEST_OS = 'nxdk'` no basta: waf lo
+   redetecta desde las macros del compilador, ve `_WIN32` y decide `win32`, y luego
+   busca `user32`. La solución es la que ya usan Switch y Vita: registrar `'NXDK'` en
+   `MACRO_TO_DESTOS` delante de la tabla estándar.
+2. **`-fPIC` no existe para `i386-pc-windows-msvc`** y clang lo rechaza como error. Un
+   PE se reubica por relocaciones. Mismo caso que el fork excluye para `psvita` y `xbox`.
+3. **`nxdk-lib` es `llvm-lib`, no `ar`**: sintaxis MSVC. Hay que vaciar `ARFLAGS`
+   (`rcs` no existe) y poner `AR_TGT_F = '/out:'`.
+4. **`bin/nxdk-link` fuerza `-fixed -base:0x00010000`**, correcto para un XBE y
+   equivocado para una DLL: `-fixed` borraría `.reloc` y esa base pisaría la imagen del
+   motor. Hay que deshacerlo con `/fixed:no` y `/base:0x10000000`.
+5. **`GiveFnptrsToDll` es `WINAPI`**, así que `dllexport` la publica decorada como
+   `_GiveFnptrsToDll@8` y el motor, que la busca por el nombre pelado, no la
+   encontraría. En MSVC lo arregla `dlls/hl.def`; aquí `lld-link` rechaza su bloque
+   `SECTIONS`, así que se pide el alias con `/export:GiveFnptrsToDll`.
+
+Con los parches: **231/231, 100 %**.
+
+> Nota de honestidad sobre el censo: la clase `Nxdk` añade `-Wno-deprecated-declarations`
+> porque nxdk marca `stricmp`/`strnicmp` como *deprecated* y hlsdk las usa por todas
+> partes. Es silenciar un aviso, no ocultar un error. El resto de la política de avisos
+> de hlsdk sí se aplica: waf comprobó los `-Werror=` soportados por clang durante el
+> `configure` y el build pasó con ellos activos.
+
+### 18.5 El enlazado: dos huecos, ambos medianos
+
+Enlazando contra las librerías de nxdk quedaron **5 símbolos sin resolver** (los ~60
+`Nt*`/`Ke*`/`Mm*` que aparecían al principio eran mi error: faltaba
+`lib/xboxkrnl/libxboxkrnl.lib` en la línea de enlace, no un hueco real):
+
+| Símbolo | Clase | Diagnóstico |
+|---|---|---|
+| `operator new`, `new[]`, `delete`, `delete[]` | **mediano** | nxdk trae el submódulo `libcxx` con todas las cabeceras, pero **no construye ninguna `libcxx.lib`**. Como nxdk-cxx fuerza `-fno-exceptions` y hlsdk no usa la STL en el camino caliente, esos cuatro operadores son lo único que faltaba. Se implementan sobre `malloc`/`free` |
+| `atof` | **mediano** | pdclib **declara** `atof()` y `strtod()` en `<stdlib.h>` pero no las implementa: el propio fichero lo dice, `/* TODO: atof(), strtof(), strtod(), strtold() */`. El enlazador la reporta referenciada **100 veces**, desde los `KeyValue()` de las entidades: es con lo que el juego parsea cada propiedad flotante de cada entidad del `.bsp`. Sin ella no carga ni un mapa |
+
+Ambos resueltos en `external/nxdk/nxdk_runtime.cpp`. El `atof` es un parser decimal con
+signo y exponente, suficiente para lo que Hammer escribe en un `.bsp`; **es un tapón,
+no la solución**: lo correcto sería implementar `strtod()` en pdclib y mandarlo aguas
+arriba a nxdk.
+
+**Resultado del enlazado:**
+
+```
+build-nxdk/dlls/opfor.dll     1.594.880 bytes   PE32 (DLL) Intel 80386
+build-nxdk/cl_dll/client.dll    437.248 bytes   PE32 (DLL) Intel 80386
+```
+
+| | `opfor.dll` | `client.dll` |
+|---|---|---|
+| Exports | **660** | **71** |
+| Imports | 60, todos por ordinal, de `xboxkrnl.exe` | ídem |
+| `.reloc` | sí | sí |
+| `GiveFnptrsToDll` sin decorar | sí | — |
+| `GetEntityAPI` / `GetEntityAPI2` | sí | — |
+| `HUD_Init` … `V_CalcRefdef` | — | sí (los 42 de `exports.txt`) |
+
+**Los 660 exports del servidor importan más de lo que parece.** No son los cuatro de
+`exports.txt`: son las funciones `Think`/`Touch`/`Use` que hlsdk marca con la macro
+`EXPORT` para que el save/restore las pueda resolver por nombre. Que estén ahí, con el
+mangling de MSVC, significa que **`COM_FunctionFromName` / `NameForFunction` funcionan
+igual que en Windows** — y por tanto que en esta vía **no hacen falta ni los datamaps
+de estilo Source que exigía HLX (§16), ni siquiera el `ofs:` por offsets validado en
+§15**. §15 se confirma como red de seguridad, no como requisito.
+
+### 18.6 EL PROBLEMA SERIO: nxdk no tiene cargador de DLLs
+
+No lo arreglo, por la condición de parada. Pero hay que dejarlo escrito porque
+**corrige la premisa central de §16**.
+
+En §16.4 escribí, como argumento decisivo para elegir nxdk sobre HLX, que nxdk ofrecía
+*"`LoadLibraryA` de nxdk — carga dinámica normal"*, y que eso *"evita todo §13/§14"*.
+**Eso es falso.** El código de `nxdk/lib/winapi/libloaderapi.c` en HEAD `29638d0`:
+
+```c
+HMODULE LoadLibraryExA (LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
+{
+    // Always fail with not having found the library
+    SetLastError(ERROR_MOD_NOT_FOUND);
+    return NULL;
+}
+```
+
+`LoadLibraryA` la llama y devuelve `NULL` siempre. No abre el fichero. No hay ningún
+cargador PE en `nxdk/lib/` — lo comprobé buscando por `IMAGE_NT_HEADERS` y `LdrLoad`.
+
+`GetProcAddress` **sí** funciona, pero **solo con `hModule == NULL`**: resuelve nombres
+contra la sección `.edataxb` del propio XBE (eso es lo que produce el
+`-merge:.edata=.edataxb` de `bin/nxdk-link`). Con un handle de módulo devuelve
+`ERROR_PROC_NOT_FOUND` sin mirar.
+
+**Y el fork de §17 depende justo de eso.** Su `lib_win.c` hace, para Xbox:
+
+```c
+#if XASH_X86 && !XASH_XBOX      // <- desactiva el cargador propio de Xash
+	if( hInst->custom_loader ) hInst->hInstance = MemoryLoadLibrary( ... );
+	else
+#endif
+	{ hInst->hInstance = LoadLibraryA( hInst->fullPath ); }   // <- stub que falla
+```
+
+Es decir: el autor **apagó el cargador PE propio de Xash** y se apoyó en el
+`LoadLibraryA` de nxdk, que no carga nada.
+
+> **Inferencia, no hecho comprobado:** en su `GetLastErrorAsString` el autor escribió el
+> comentario *"nxdk: LoadLibraryExA maps any read/open failure to ERROR_MOD_NOT_FOUND"*
+> y el mensaje *"open/read/size failed; not only missing path"*. Eso describe un
+> `LoadLibraryExA` que **sí abre y lee el fichero**, que no es el de nxdk upstream. Lo
+> más probable es que esté trabajando contra un nxdk parcheado en local. Si es así, ese
+> parche es **una tercera pieza que falta**, además de `xbox.py` y `xbox_sbrk.c` de
+> §17.3 — y la más grande de las tres. Refuerza la recomendación de §17.5: preguntar al
+> autor, y preguntarle también por esto.
+
+### 18.7 La salida probable: Xash ya trae su propio cargador PE
+
+`engine/platform/win32/lib_custom_win.c`, **464 líneas**, presente tanto en nuestro
+`xash3d-fwgs` como en el fork. Es `MemoryLoadLibrary`, el cargador en memoria que FWGS
+usa para tragarse DLLs en formato GoldSrc. Qué APIs de Win32 necesita, y qué tiene nxdk:
+
+| API | ¿En nxdk? | Si no |
+|---|---|---|
+| `VirtualAlloc` | ✅ | |
+| `VirtualFree` | ✅ | |
+| `VirtualProtect` | ❌ | `NtProtectVirtualMemory` está en `xboxkrnl`; o un stub que devuelva TRUE |
+| `HeapAlloc` | ❌ | `malloc` |
+| `IsBadReadPtr` | ❌ | el fork ya lo stubea a FALSE |
+| `GetProcAddress` | ✅ | |
+
+Y la resolución de imports del gamedll cargado es más fácil de lo habitual: **importa de
+un solo módulo, `xboxkrnl.exe`, y todo por ordinal** — que es exactamente lo que el
+cargador de XBE de la consola ya hace al arrancar.
+
+Otra opción, más limpia y más trabajo: enlazar el gamedll **sin ninguna librería de
+nxdk**, de modo que resuelva su libc contra el XBE del motor vía `.edataxb`. Medí esa
+superficie: **55 símbolos para el servidor, 52 para el cliente**, y son todos libc plana
+(`malloc`, `memcpy`, `sinf`, `sprintf`, `fopen`…) más media docena de helpers de MSVC
+(`__chkstk`, `__fltused`, `__purecall`). Esto resolvería de paso el riesgo de §18.9.
+
+Ninguna de las dos está escrita. Lo que sí está medido es que **son un problema de
+cientos de líneas, no del orden de la odisea de enlazado estático de §13/§14**.
+
+### 18.8 Qué falta para el gamedll Xbox completo — estimación honesta
+
+Lo que hay hoy: **una DLL que compila, enlaza, exporta lo correcto y nadie ha
+ejecutado nunca.** Cero validación en runtime. Ni en xemu ni en consola.
+
+| # | Falta | Tamaño | Bloquea |
+|---|---|---|---|
+| 1 | **Que el motor arranque en Xbox** (los ficheros que faltan de §17.3 + el nxdk parcheado de §18.6) | grande, y no es nuestro | todo |
+| 2 | **Un camino para cargar la DLL**: reactivar `MemoryLoadLibrary` con 3 stubs, o implementar `LoadLibraryEx` en nxdk | mediano (§18.7) | todo |
+| 3 | `atof` de verdad (`strtod` en pdclib) en vez de nuestro tapón | pequeño | precisión de las entidades |
+| 4 | Decidir qué hacer con las dos instancias de libc (§18.9) | por determinar | estabilidad |
+| 5 | Entrada de mando en lugar del ratón neutralizado en `in_camera.cpp` | pequeño | cámara en 3ª persona |
+| 6 | Presupuesto de memoria: 64 MB en Xbox retail, y `opfor.dll` son 1,52 MB sin contar el heap del juego | por medir | jugabilidad |
+| 7 | Validar en xemu (necesita los volcados de §17.4) | — | todo lo anterior |
+
+**Lo que esta sesión sí zanja:** el gamedll de Opposing Force **no es el problema del
+port**. Compila entero, enlaza limpio y con la ABI correcta. El problema está aguas
+arriba, en el motor y en el cargador — donde §16 daba por resuelto que no lo estaba.
+
+### 18.9 Riesgo abierto, no verificado: dos libc en el proceso
+
+El mapa del enlazador confirma que pdclib entra **estáticamente dentro del gamedll**:
+
+```
+_malloc    libpdclib:malloc.obj
+_free      libpdclib:malloc.obj
+_strcmp    libpdclib:strcmp.obj
+```
+
+Y el XBE del motor llevará la suya. Eso son **dos heaps y dos estados de libc en el
+mismo proceso**. En Windows no pasa porque ambos módulos importan el mismo CRT del
+sistema. Si el motor y el juego se pasan punteros que uno reserva y el otro libera, eso
+revienta.
+
+**No lo he verificado** — habría que auditar el interfaz `enginefuncs_t`. Lo apunto
+porque la opción "resolver la libc del gamedll contra el XBE" de §18.7 lo elimina de
+raíz, lo que es un argumento a su favor más allá del tamaño.
+
+### 18.10 Estado del entorno tras esta sesión
+
+```
+~/opposing-force-x/
+├── hlsdk-portable/
+│   ├── build-nxdk/          NUEVO — opfor.dll 1,52 MB + client.dll 427 KB
+│   ├── external/nxdk/       NUEVO — capa de compatibilidad (4 ficheros)
+│   ├── wscript                       M  <- §18.4b
+│   ├── dlls/wscript                  M  <- §18.4b (ya lo estaba por §11.4)
+│   ├── cl_dll/wscript                M  <- §18.4b (ya lo estaba por §11.4)
+│   └── scripts/waifulib/xcompile.py  M  <- §18.4b
+├── nxdk-census/             NUEVO — scripts del censo, logs y objetos
+└── hlsdk-nxdk-gamedll.patch NUEVO — el parche de 169 líneas
+```
+
+`game/`, `game-win32/`, `game-offsets/` y el toolchain de §17 intactos. Comprobada la
+no-regresión: `./waf configure -4 && ./waf build` sigue produciendo `opfor.so` y
+`client.so`.
+
+Reproducir el build de Xbox:
+
+```bash
+export NXDK_DIR=/opt/toolchains/xbox/nxdk
+export PATH="$NXDK_DIR/bin:$PATH"
+cd ~/opposing-force-x/hlsdk-portable
+./waf configure --nxdk -T release -o build-nxdk && ./waf build
+```
+
+**Aviso sobre las cifras de este apartado:** todas miden compilación y enlazado
+estático. La única afirmación de runtime que contiene §18 es que **no ha habido
+ninguna**.

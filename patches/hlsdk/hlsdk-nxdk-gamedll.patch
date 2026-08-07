@@ -1,0 +1,557 @@
+diff --git a/cl_dll/wscript b/cl_dll/wscript
+index 99bd7ea5..1bca9240 100644
+--- a/cl_dll/wscript
++++ b/cl_dll/wscript
+@@ -40,7 +40,7 @@ def configure(conf):
+ 			conf.fatal('VGUI was enabled but VGUI cannot be used')
+ 
+ def build(bld):
+-	libs = ['vcs_info']
++	libs = []
+ 	defines = ['CLIENT_DLL']
+ 	defines += bld.env.EXPORT_DEFINES_LIST
+ 	includes = ['.',
+@@ -79,6 +79,7 @@ def build(bld):
+ 	source += bld.path.parent.ant_glob('game_shared/*.cpp', excl=excluded_files)
+ 	source += bld.path.parent.ant_glob([
+ 		'public/safe_snprintf.c',
++		'game_shared/vcs_info.c',
+ 		'pm_shared/*.c',
+ 		'dlls/crossbow.cpp',
+ 		'dlls/crowbar.cpp',
+@@ -109,6 +110,10 @@ def build(bld):
+ 	if bld.env.DEST_OS == 'win32':
+ 		libs += ['USER32']
+ 
++	if bld.env.DEST_OS == 'nxdk':
++		# see dlls/wscript: pieces of runtime that nxdk does not provide
++		source += bld.path.parent.ant_glob('external/nxdk/nxdk_runtime.cpp')
++
+ 	if bld.env.GOLDSOURCE_SUPPORT:
+ 		defines += ['GOLDSOURCE_SUPPORT']
+ 		includes += ['../external/']
+diff --git a/dlls/wscript b/dlls/wscript
+index 71b06c49..1ebd323c 100644
+--- a/dlls/wscript
++++ b/dlls/wscript
+@@ -23,7 +23,8 @@ def build(bld):
+ 	excluded_files = ['mpstubb.cpp', 'stats.cpp', 'Wxdebug.cpp', 'gearbox/gearbox_client.cpp']
+ 
+ 	source = bld.path.ant_glob('**/*.cpp', excl=excluded_files)
+-	source += bld.path.parent.ant_glob(['pm_shared/*.c', 'public/safe_snprintf.c'])
++	source += bld.path.parent.ant_glob(['pm_shared/*.c', 'public/safe_snprintf.c',
++		'game_shared/vcs_info.c'])
+ 
+ 	defines = bld.env.EXPORT_DEFINES_LIST
+ 	if 'HAVE_STRLCPY=1' not in defines:
+@@ -32,6 +33,11 @@ def build(bld):
+ 	if 'HAVE_STRLCAT=1' not in defines:
+ 		source += bld.path.parent.ant_glob('external/openbsd/strlcat.c')
+ 
++	if bld.env.DEST_OS == 'nxdk':
++		# global operator new/delete (nxdk ships no built libc++) and atof()
++		# (declared but not implemented in pdclib)
++		source += bld.path.parent.ant_glob('external/nxdk/nxdk_runtime.cpp')
++
+ 	if bld.env.USE_VOICEMGR:
+ 		source += ['../game_shared/voice_gamemgr.cpp']
+ 	else:
+@@ -62,6 +68,15 @@ def build(bld):
+ 		# on Windows or if no gamedll_osx or gamedll_linux is set, use default gamedll key
+ 		server_dll_name = bld.env.SERVER_LIBRARY_NAME
+ 
++	extra_linkflags = []
++	if bld.env.DEST_OS == 'nxdk':
++		# Same problem hl.def solves for MSVC: GiveFnptrsToDll is WINAPI, so
++		# dllexport publishes it decorated as _GiveFnptrsToDll@8 and the engine,
++		# which looks it up by the plain name, would not find it. hl.def itself
++		# is not usable here (lld-link rejects its SECTIONS block), so the
++		# undecorated alias is requested directly.
++		extra_linkflags += ['-Wl,/export:GiveFnptrsToDll']
++
+ 	bld.shlib(
+ 		source   = source,
+ 		target   = server_dll_name + bld.env.POSTFIX,
+@@ -69,7 +84,7 @@ def build(bld):
+ 		features = 'c cxx',
+ 		includes = includes,
+ 		defines  = defines,
+-		use      = 'vcs_info',
++		linkflags = extra_linkflags,
+ 		install_path = install_path,
+ 		idx = bld.get_taskgen_count()
+ 	)
+diff --git a/external/nxdk/memory.h b/external/nxdk/memory.h
+new file mode 100644
+index 00000000..56c0883c
+--- /dev/null
++++ b/external/nxdk/memory.h
+@@ -0,0 +1,13 @@
++/*
++ * memory.h — TRIVIAL.
++ *
++ * Cabecera histórica de MSVC/SysV que solo declara memcpy/memmove/memset/memcmp
++ * /memchr. C89 las movió a <string.h> y ahí es donde pdclib las tiene. La
++ * incluye cl_dll/entity.cpp (una línea, herencia del SDK original de Valve).
++ */
++#ifndef NXDK_COMPAT_MEMORY_H
++#define NXDK_COMPAT_MEMORY_H
++
++#include <string.h>
++
++#endif
+diff --git a/external/nxdk/nxdk_compat.h b/external/nxdk/nxdk_compat.h
+new file mode 100644
+index 00000000..9e1f2931
+--- /dev/null
++++ b/external/nxdk/nxdk_compat.h
+@@ -0,0 +1,70 @@
++/*
++ * nxdk_hlsdk_compat.h — capa de compatibilidad para compilar hlsdk-portable
++ * (rama opfor) con el toolchain nxdk (clang -target i386-pc-windows-msvc).
++ *
++ * Se inyecta con -include; no se toca ningún fuente de hlsdk. Ese es el punto:
++ * el árbol de hlsdk sigue produciendo los builds i386/win32 que ya funcionan.
++ *
++ * Cada bloque documenta QUÉ falta en nxdk y POR QUÉ el reemplazo es válido.
++ * Un port de verdad movería esto a la capa de plataforma de hlsdk; aquí sirve
++ * para medir cuánto código del juego compila sin tocarlo.
++ */
++#ifndef NXDK_HLSDK_COMPAT_H
++#define NXDK_HLSDK_COMPAT_H
++
++#ifdef NXDK
++
++/* ------------------------------------------------------------------ TRIVIAL
++ * va_list. En MSVC llega por <vadefs.h> arrastrado por <windows.h>; el
++ * windows.h reducido de nxdk no lo hace. pdclib sí trae <stdarg.h> completo.
++ * Afecta a dlls/util.cpp y cl_dll/hl/hl_weapons.cpp (ALERT/Con_Printf varargs).
++ */
++#include <stdarg.h>
++
++/* ------------------------------------------------------------------ TRIVIAL
++ * DLL_PROCESS_ATTACH / DLL_PROCESS_DETACH. El winnt.h de nxdk no los declara
++ * porque nxdk no tiene cargador de DLLs (ver §18.5): nada llama nunca a
++ * DllMain. Los valores son los de la ABI de Win32; se definen para que
++ * dlls/h_export.cpp compile tal cual.
++ */
++#ifndef DLL_PROCESS_DETACH
++#define DLL_PROCESS_DETACH 0
++#endif
++#ifndef DLL_PROCESS_ATTACH
++#define DLL_PROCESS_ATTACH 1
++#endif
++#ifndef DLL_THREAD_ATTACH
++#define DLL_THREAD_ATTACH  2
++#endif
++#ifndef DLL_THREAD_DETACH
++#define DLL_THREAD_DETACH  3
++#endif
++
++/* ------------------------------------------------------------------ MEDIANO
++ * POINT. Estructura de <windef.h> ausente en nxdk. cl_dll/in_camera.cpp la usa
++ * solo como par de enteros para recordar la posición del ratón en la cámara en
++ * tercera persona. La definición es la de Win32 (dos LONG).
++ */
++#ifndef _NXDK_HAVE_POINT
++#define _NXDK_HAVE_POINT
++typedef struct _NXDK_POINT { long x, y; } POINT, *PPOINT, *LPPOINT;
++#endif
++
++/* ------------------------------------------------------------------ MEDIANO
++ * SetCursorPos / GetCursorPos. API de cursor de escritorio; en Xbox no existe
++ * puntero que leer ni recentrar. cl_dll/in_camera.cpp las usa para fijar el
++ * ratón al centro de la ventana mientras se arrastra la cámara en tercera
++ * persona. Se neutralizan: Set no hace nada, Get devuelve (0,0) —lo que anula
++ * el delta y deja la cámara quieta en vez de darle basura—. En consola esa
++ * entrada vendrá del stick derecho, que ya es delta puro y no necesita
++ * recentrado. Es un cambio de comportamiento deliberado, no una traducción.
++ */
++#ifndef SetCursorPos
++#define SetCursorPos( x, y ) ( (void)(x), (void)(y), 0 )
++#endif
++#ifndef GetCursorPos
++#define GetCursorPos( p ) ( (p) ? ( (p)->x = 0, (p)->y = 0, 1 ) : 0 )
++#endif
++
++#endif /* NXDK */
++#endif /* NXDK_HLSDK_COMPAT_H */
+diff --git a/external/nxdk/nxdk_runtime.cpp b/external/nxdk/nxdk_runtime.cpp
+new file mode 100644
+index 00000000..091dc997
+--- /dev/null
++++ b/external/nxdk/nxdk_runtime.cpp
+@@ -0,0 +1,130 @@
++/*
++ * nxdk_hlsdk_rt.cpp — piezas de runtime que nxdk no trae y que el gamedll de
++ * Opposing Force necesita para enlazar. Dos huecos, ambos "medianos" en la
++ * clasificación de §18: función de biblioteca ausente pero reemplazable.
++ *
++ * Se compila con nxdk-cxx y se añade al enlazado.
++ */
++
++#include <stdlib.h>
++#include <ctype.h>
++
++/* =========================================================================
++ * 1) operator new / delete globales.
++ *
++ * nxdk trae el submódulo libcxx pero NO construye ninguna libcxx.lib: en
++ * lib/ solo hay libpdclib, libwinapi, libxboxrt, libnxdk*. Las cabeceras de
++ * C++ están, la biblioteca no. Como hlsdk se compila con -fno-exceptions
++ * (nxdk-cxx lo fuerza) y no usa RTTI ni contenedores de la STL en el camino
++ * caliente, los únicos símbolos de C++ que faltaban al enlazar el gamedll son
++ * estos cuatro operadores.
++ *
++ * Implementación sobre malloc/free, que sí están en pdclib. Sin excepciones,
++ * un new fallido devuelve NULL en vez de lanzar std::bad_alloc — que es
++ * exactamente lo que hace el resto de GoldSrc de todos modos.
++ * ========================================================================= */
++
++void *operator new( unsigned int size )
++{
++	if( size == 0 ) size = 1;
++	return malloc( size );
++}
++
++void *operator new[]( unsigned int size )
++{
++	if( size == 0 ) size = 1;
++	return malloc( size );
++}
++
++void operator delete( void *p )
++{
++	free( p );
++}
++
++void operator delete[]( void *p )
++{
++	free( p );
++}
++
++/* delete dimensionado (C++14). Clang lo emite en algunos sitios; se redirige. */
++void operator delete( void *p, unsigned int )
++{
++	free( p );
++}
++
++void operator delete[]( void *p, unsigned int )
++{
++	free( p );
++}
++
++/* =========================================================================
++ * 2) atof().
++ *
++ * pdclib DECLARA atof() y strtod() en <stdlib.h> pero no las implementa:
++ *     /_* TODO: atof(), strtof(), strtod(), strtold() *_/
++ * El enlazado lo confirma: _atof queda sin resolver, referenciado 100 veces
++ * desde los KeyValue() de las entidades. Es la función con la que el juego
++ * parsea CADA propiedad flotante de CADA entidad del .bsp, así que sin ella
++ * no se carga ni un mapa.
++ *
++ * Parser decimal con signo y exponente opcional, suficiente para los valores
++ * que Hammer/Worldcraft escriben en un .bsp. No cubre hex-float, infinitos,
++ * NaN ni redondeo correctamente redondeado — nada de eso aparece en un mapa
++ * de GoldSrc.
++ *
++ * NOTA: esto es un tapón para el censo, no la solución definitiva. Lo correcto
++ * sería implementar strtod() en pdclib y mandarlo aguas arriba a nxdk.
++ * ========================================================================= */
++
++extern "C" double atof( const char *nptr )
++{
++	const char *s = nptr;
++	int neg = 0;
++	double val = 0.0;
++
++	if( !s ) return 0.0;
++
++	while( isspace( (unsigned char)*s )) s++;
++
++	if( *s == '-' ) { neg = 1; s++; }
++	else if( *s == '+' ) s++;
++
++	/* parte entera */
++	while( *s >= '0' && *s <= '9' )
++		val = val * 10.0 + (double)( *s++ - '0' );
++
++	/* parte fraccionaria */
++	if( *s == '.' )
++	{
++		double scale = 0.1;
++		s++;
++		while( *s >= '0' && *s <= '9' )
++		{
++			val += (double)( *s++ - '0' ) * scale;
++			scale *= 0.1;
++		}
++	}
++
++	/* exponente */
++	if( *s == 'e' || *s == 'E' )
++	{
++		const char *save = s;
++		int eneg = 0, exp = 0, digits = 0;
++		s++;
++		if( *s == '-' ) { eneg = 1; s++; }
++		else if( *s == '+' ) s++;
++		while( *s >= '0' && *s <= '9' ) { exp = exp * 10 + ( *s++ - '0' ); digits++; }
++
++		if( !digits ) s = save;   /* 'e' suelta: no era exponente */
++		else
++		{
++			double p = 1.0;
++			if( exp > 308 ) exp = 308;
++			while( exp-- ) p *= 10.0;
++			if( eneg ) val /= p;
++			else       val *= p;
++		}
++	}
++
++	return neg ? -val : val;
++}
+diff --git a/external/nxdk/sys/types.h b/external/nxdk/sys/types.h
+new file mode 100644
+index 00000000..789bbaea
+--- /dev/null
++++ b/external/nxdk/sys/types.h
+@@ -0,0 +1,18 @@
++/*
++ * sys/types.h — TRIVIAL.
++ *
++ * pdclib es una libc C99/C11 estricta: no implementa la jerarquía <sys/*> de
++ * POSIX. external/openbsd/strlcpy.c y strlcat.c la incluyen por costumbre BSD,
++ * pero de ella solo necesitan size_t, que es estándar y vive en <stddef.h>.
++ *
++ * Nota: hacen falta porque nxdk NO trae strlcpy/strlcat (verificado: no están
++ * ni en pdclib/include/string.h ni en xboxrt/libc_extensions/string_ext_.h),
++ * así que HAVE_STRLCPY/HAVE_STRLCAT dan falso y waf compila las de OpenBSD.
++ */
++#ifndef NXDK_COMPAT_SYS_TYPES_H
++#define NXDK_COMPAT_SYS_TYPES_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#endif
+diff --git a/scripts/waifulib/xcompile.py b/scripts/waifulib/xcompile.py
+index 548a64dc..5ac80aa5 100644
+--- a/scripts/waifulib/xcompile.py
++++ b/scripts/waifulib/xcompile.py
+@@ -42,6 +42,8 @@ NSWITCH_ENVVARS = ['DEVKITPRO']
+ 
+ PSVITA_ENVVARS = ['VITASDK']
+ 
++NXDK_ENVVARS = ['NXDK_DIR']
++
+ # This class does support ONLY r10e and r19c/r20 NDK
+ class Android:
+ 	ctx            = None # waf context
+@@ -525,6 +527,88 @@ class PSVita:
+ 		ldflags = []
+ 		return ldflags
+ 
++class Nxdk:
++	'''Original Xbox, via the nxdk toolchain (https://github.com/XboxDev/nxdk).
++
++	Modelled on the PSVita and NintendoSwitch classes above: a console SDK
++	rooted at one environment variable, exposing cc/cxx/ar/strip and the flag
++	sets the target needs.
++
++	Two things make this one different from the other consoles:
++
++	  * nxdk is not a GCC cross-toolchain but clang targeting
++	    i386-pc-windows-msvc, with lld-link as linker. So the C++ ABI is the
++	    MSVC one -- the same ABI the original GoldSrc gamedlls use.
++	  * The libc is pdclib plus a small Win32 shim, both freestanding. Hence
++	    -ffreestanding -nostdlib and the pile of -I in nxdk-cc; we reuse the
++	    nxdk-cc/nxdk-cxx wrappers rather than duplicating that list here.
++	'''
++	ctx      = None # waf context
++	arch     = 'x86'
++	nxdk_dir = None
++
++	def __init__(self, ctx):
++		self.ctx = ctx
++
++		for i in NXDK_ENVVARS:
++			self.nxdk_dir = os.getenv(i)
++			if self.nxdk_dir != None:
++				break
++		else:
++			ctx.fatal('Set %s environment variable pointing to the nxdk directory!' %
++				' or '.join(NXDK_ENVVARS))
++
++		self.nxdk_dir = os.path.abspath(self.nxdk_dir)
++
++		for i in ['bin/nxdk-cc', 'bin/nxdk-cxx', 'lib/libpdclib.lib']:
++			if not os.path.exists(os.path.join(self.nxdk_dir, i)):
++				ctx.fatal('`%s` not found in `%s`. Build nxdk first (make -C samples/hello)!' %
++					(i, self.nxdk_dir))
++
++	def gen_toolchain_path(self):
++		return os.path.join(self.nxdk_dir, 'bin', 'nxdk-')
++
++	def cc(self):
++		return self.gen_toolchain_path() + 'cc'
++
++	def cxx(self):
++		return self.gen_toolchain_path() + 'cxx'
++
++	def ar(self):
++		return self.gen_toolchain_path() + 'lib'
++
++	def strip(self):
++		return 'true' # lld-link strips already; there is no nxdk-strip
++
++	def cflags(self, cxx = False):
++		cflags = []
++		# the wrappers already set -target/-march/-ffreestanding/-nostdlib and
++		# every -I of pdclib, libcxx, winapi and the vcruntime shims
++		cflags += ['-DNXDK', '-D_XBOX']
++		# pdclib is C99/C11-strict and has no <sys/*>; hlsdk expects a few
++		# things that only live in the nxdk compat headers
++		cflags += ['-I%s' % os.path.join(self.nxdk_dir, 'lib', 'xboxrt', 'libc_extensions')]
++		# no cursor, no window manager, no DLL loader: see the compat header
++		cflags += ['-Wno-deprecated-declarations']
++		return cflags
++
++	def linkflags(self):
++		# A gamedll is a real PE DLL: relocatable, no entry point (DllMain is
++		# never called, because nxdk has no loader), i386.
++		#
++		# /fixed:no and /base undo two defaults that bin/nxdk-link hardcodes for
++		# XBE executables: -fixed would drop the .reloc section, and
++		# -base:0x00010000 would put the DLL on top of the engine's own image.
++		return ['-Wl,/dll', '-Wl,/noentry', '-Wl,/machine:x86',
++			'-Wl,/nodefaultlib', '-Wl,/fixed:no', '-Wl,/base:0x10000000']
++
++	def ldflags(self):
++		l = os.path.join(self.nxdk_dir, 'lib')
++		return [os.path.join(l, i) for i in
++			['libpdclib.lib', 'libxboxrt.lib', 'libwinapi.lib',
++			 'libnxdk.lib', 'libnxdk_hal.lib',
++			 os.path.join('xboxkrnl', 'libxboxkrnl.lib')]]
++
+ def options(opt):
+ 	xc = opt.add_option_group('Cross compile options')
+ 	xc.add_option('--android', action='store', dest='ANDROID_OPTS', default=None,
+@@ -537,6 +621,8 @@ def options(opt):
+ 		help='enable building for Nintendo Switch [default: %(default)s]')
+ 	xc.add_option('--psvita', action='store_true', dest='PSVITA', default = False,
+ 		help='enable building for PlayStation Vita [default: %(default)s]')
++	xc.add_option('--nxdk', action='store_true', dest='NXDK', default = False,
++		help='enable building for original Xbox via nxdk [default: %(default)s]')
+ 	xc.add_option('--sailfish', action='store', dest='SAILFISH', default = None,
+ 		help='enable building for Sailfish/Aurora')
+ 	xc.add_option('--emscripten', action='store_true', dest='EMSCRIPTEN', default = None,
+@@ -636,6 +722,21 @@ def configure(conf):
+ 		conf.env.LIB_M = ['m']
+ 		conf.env.VRTLD = ['vrtld']
+ 		conf.env.DEST_OS = 'psvita'
++	elif conf.options.NXDK:
++		conf.nxdk = nxdk = Nxdk(conf)
++		conf.environ['CC'] = nxdk.cc()
++		conf.environ['CXX'] = nxdk.cxx()
++		conf.environ['AR'] = nxdk.ar()
++		conf.environ['STRIP'] = nxdk.strip()
++		conf.env.CFLAGS += nxdk.cflags()
++		conf.env.CXXFLAGS += nxdk.cflags(True)
++		conf.env.LINKFLAGS += nxdk.linkflags()
++		conf.env.LDFLAGS += nxdk.ldflags()
++		# pdclib provides the math functions hlsdk needs; there is no separate libm
++		conf.env.HAVE_M = True
++		conf.env.LIB_M = []
++		conf.env.DEST_OS = 'nxdk'
++		conf.env.DEST_CPU = 'x86'
+ 	elif conf.options.EMSCRIPTEN:
+ 		# Emscripten compiler is just wrapper to clang
+ 		# But we need to setup platform modifiers, they all are contained inside c_emscripten.py for now
+@@ -650,7 +751,10 @@ def configure(conf):
+ 	conf.env.MAGX = conf.options.MAGX
+ 	conf.env.MSVC_WINE = conf.options.MSVC_WINE
+ 	conf.env.SAILFISH = conf.options.SAILFISH
+-	MACRO_TO_DESTOS = OrderedDict({ '__ANDROID__' : 'android', '__SWITCH__' : 'nswitch', '__vita__' : 'psvita', '__wasi__': 'wasi', '__EMSCRIPTEN__' : 'emscripten' })
++	# NXDK must come before the stock table: nxdk-cc targets i386-pc-windows-msvc,
++	# so _WIN32 is defined and waf would otherwise call this a plain win32 build
++	# and go looking for user32/winmm.
++	MACRO_TO_DESTOS = OrderedDict({ '__ANDROID__' : 'android', '__SWITCH__' : 'nswitch', '__vita__' : 'psvita', 'NXDK' : 'nxdk', '__wasi__': 'wasi', '__EMSCRIPTEN__' : 'emscripten' })
+ 	for k in c_config.MACRO_TO_DESTOS:
+ 		MACRO_TO_DESTOS[k] = c_config.MACRO_TO_DESTOS[k] # ordering is important
+ 	c_config.MACRO_TO_DESTOS  = MACRO_TO_DESTOS
+diff --git a/wscript b/wscript
+index 3fc69fe3..46c98949 100644
+--- a/wscript
++++ b/wscript
+@@ -99,7 +99,20 @@ def configure(conf):
+ 
+ 	conf.load('msvs msdev subproject clang_compilation_database strip_on_install enforce_pic')
+ 
+-	conf.check_pic(True) # modern defaults
++	if conf.env.DEST_OS == 'nxdk':
++		# external/nxdk holds the compat layer for the gaps between pdclib and
++		# what hlsdk assumes: <sys/types.h>, <memory.h>, va_list, the
++		# DLL_PROCESS_* constants and the cursor API. The header is force-included
++		# so that no hlsdk source has to be touched.
++		nxdk_compat = conf.path.find_dir('external/nxdk').abspath()
++		for flags in ['CFLAGS', 'CXXFLAGS']:
++			conf.env.append_unique(flags, ['-I%s' % nxdk_compat,
++				'-include', os.path.join(nxdk_compat, 'nxdk_compat.h')])
++
++	# PE images are relocated by the loader, so -fPIC is meaningless there and
++	# clang rejects it outright for i386-pc-windows-msvc. Same exclusion the
++	# FWGS engine wscript applies to psvita and xbox.
++	conf.check_pic(conf.env.DEST_OS != 'nxdk') # modern defaults
+ 	if conf.env.DEST_OS != 'win32':
+ 		def check_libc_extension(frag, msg, define):
+ 			conf.export_define(define, conf.simple_check(frag, msg, use='werror export'))
+@@ -219,6 +232,11 @@ def configure(conf):
+ 
+ 		# LIB_M added in xcompile!
+ 		pass
++	elif conf.env.DEST_OS == 'nxdk':
++		# nxdk has no libm: the math functions live inside pdclib/libxboxrt,
++		# which xcompile already puts on the link line. And no user32/winmm
++		# either -- there is no window manager on the Xbox.
++		pass
+ 	elif conf.env.DEST_OS == 'win32':
+ 		a = [ 'user32', 'winmm' ]
+ 		if conf.env.COMPILER_CC == 'msvc':
+@@ -253,6 +271,13 @@ def configure(conf):
+ 		conf.define('_CRT_NONSTDC_NO_DEPRECATE', True)
+ 	elif conf.env.COMPILER_CC == 'owcc':
+ 		pass
++	elif conf.env.DEST_OS == 'nxdk':
++		# The Xbox target is Win32-ABI (clang -target i386-pc-windows-msvc), so
++		# it must NOT take the Linux branch below: _WIN32 is already defined by
++		# the compiler and defining _LINUX on top of it makes hlsdk take both
++		# code paths at once. nxdk supplies stricmp/strnicmp/_snprintf itself in
++		# lib/xboxrt/libc_extensions, so no aliasing is needed either.
++		conf.env.append_unique('CXXFLAGS', ['-Wno-invalid-offsetof', '-fno-exceptions'])
+ 	else:
+ 		conf.env.append_unique('CXXFLAGS', ['-Wno-invalid-offsetof', '-fno-exceptions'])
+ 		conf.define('stricmp', 'strcasecmp', quote=False)
+@@ -283,6 +308,21 @@ def configure(conf):
+ 	if conf.env.HLDEMO_BUILD and conf.env.OEM_BUILD:
+ 		conf.fatal('Don\'t mix Demo and OEM builds!')
+ 
++	if conf.env.DEST_OS == 'nxdk':
++		# waf does not know this DEST_OS, so it falls back to the ELF pattern.
++		# The gamedll is a PE DLL and the engine looks it up as `opfor.dll`.
++		conf.env.cshlib_PATTERN = conf.env.cxxshlib_PATTERN = '%s.dll'
++		conf.env.implib_PATTERN = '%s.lib'
++		conf.env.cstlib_PATTERN = conf.env.cxxstlib_PATTERN = '%s.lib'
++		# DEST_BINFMT is 'pe', so waf's apply_implib wants to emit an import
++		# library and needs to know the flag for it. The link goes through the
++		# clang driver, hence the -Wl, prefix on this lld-link option.
++		conf.env.IMPLIB_ST = '-Wl,/implib:%s'
++		# nxdk-lib is llvm-lib, i.e. MSVC `lib` syntax, not GNU `ar`: no 'rcs'
++		# and the output goes in /out: instead of being the first positional.
++		conf.env.ARFLAGS = []
++		conf.env.AR_TGT_F = '/out:'
++
+ 	# strip lib from pattern
+ 	if conf.env.DEST_OS != 'android':
+ 		if conf.env.cxxshlib_PATTERN.startswith('lib'):
