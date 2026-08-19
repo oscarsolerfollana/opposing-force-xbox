@@ -1,0 +1,999 @@
+diff --git a/3rdparty/opus/wscript b/3rdparty/opus/wscript
+index 28bb5d1..2275d43 100644
+--- a/3rdparty/opus/wscript
++++ b/3rdparty/opus/wscript
+@@ -71,7 +71,23 @@ def configure(conf):
+ 			if conf.env.DEST_SIZEOF_VOID_P > 4:
+ 				conf.define('OPUS_X86_PRESUME_SSE', 1)
+ 
+-		if conf.check(header_name='emmintrin.h', mandatory = False):
++		# XTRACE -- Opposing Force X, BUILD.md section 21. Not upstream.
++		#
++		# The Xbox CPU is a Pentium III Coppermine: MMX and SSE, no SSE2.
++		# Asking whether emmintrin.h exists answers the wrong question --
++		# clang ships it for every x86 target, whatever the CPU -- and the
++		# -msse2 below goes into the *shared* conf.env.CFLAGS, so every
++		# subproject configured after this one inherits it. The engine is
++		# deliberately last in SUBDIRS, so it got the flag too, and the first
++		# double arithmetic it executed was an invalid opcode on the console.
++		# See BUILD.md section 21.2.
++		#
++		# Nothing is lost here: on 32-bit opus dispatches at run time
++		# (OPUS_HAVE_RTCD below), so its SSE2 paths were dead code on this CPU
++		# to begin with.
++		if conf.env.DEST_OS == 'xbox':
++			pass
++		elif conf.check(header_name='emmintrin.h', mandatory = False):
+ 			if conf.env.COMPILER_CC != 'msvc':
+ 				conf.env.CFLAGS += ['-msse2']
+ 			conf.define('OPUS_X86_MAY_HAVE_SSE2', 1)
+@@ -122,10 +138,18 @@ def build(bld):
+ 	elif bld.env.DEST_CPU.startswith('x86'):
+ 		sources += ['opus/silk/x86/x86_silk_map.c',
+ 			'opus/celt/x86/pitch_sse.c',
+-			'opus/celt/x86/pitch_sse2.c',
+-			'opus/celt/x86/vq_sse2.c',
+ 			'opus/celt/x86/x86_celt_map.c',
+ 			'opus/celt/x86/x86cpu.c']
++
++		# XTRACE -- Opposing Force X, BUILD.md section 21. Not upstream.
++		# These two are unconditional SSE2 -- they include <emmintrin.h> and
++		# use the intrinsics with no #ifdef around the body -- so dropping
++		# OPUS_X86_MAY_HAVE_SSE2 in configure() is not enough, the files have
++		# to go too. The Pentium III in the console has no SSE2 and the run
++		# time dispatch would never have reached them.
++		if bld.env.DEST_OS != 'xbox':
++			sources += ['opus/celt/x86/pitch_sse2.c',
++				'opus/celt/x86/vq_sse2.c']
+ 		includes += ['opus/silk/x86', 'opus/celt/x86']
+ 
+ 	defines = ['OPUS_BUILD', 'FLOAT_APPROX', 'PACKAGE_VERSION="1.4.0"', 'CUSTOM_MODES', 'ENABLE_HARDENING']
+diff --git a/engine/client/cl_game.c b/engine/client/cl_game.c
+index 81041b4..a21ae75 100644
+--- a/engine/client/cl_game.c
++++ b/engine/client/cl_game.c
+@@ -3961,8 +3961,22 @@ qboolean CL_LoadProgs( const char *name )
+ 	else
+ 		try_internal_vgui_support = true; // we failed to load vgui_support, but let's probe client.dll for support anyway
+ 
++	/*
++	XTRACE -- Opposing Force X boot tracing, BUILD.md section 26. Not
++	upstream. See engine/platform/xbox/xbox_trace.c.
++	*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
++	XTRACE( "CL_LoadProgs: COM_LoadLibrary(%s)", name );
++
+ 	clgame.hInstance = COM_LoadLibrary( name, false, false );
+ 
++	XTRACE( "CL_LoadProgs: handle=%p", clgame.hInstance );
++
+ 	if( !clgame.hInstance )
+ 		return false;
+ 
+@@ -3970,6 +3984,9 @@ qboolean CL_LoadProgs( const char *name )
+ 	if( try_internal_vgui_support && VGui_LoadProgs( clgame.hInstance ))
+ 		VGui_Startup( refState.width, refState.height );
+ 
++	XTRACE( "CL_LoadProgs: vgui step done, resolving %d exports",
++		(int)ARRAYSIZE( cdll_exports ));
++
+ 	// clear exports
+ 	ClearExports( cdll_exports, ARRAYSIZE( cdll_exports ));
+ 
+@@ -4000,6 +4017,10 @@ qboolean CL_LoadProgs( const char *name )
+ 		// functions are cleared before all the extensions are evaluated
+ 		if(( *(cdll_exports[i].func) = (void *)COM_GetProcAddress( clgame.hInstance, cdll_exports[i].name )) == NULL )
+ 		{
++			// XTRACE -- one line per missing entry point, because a name that
++			// does not resolve here is a hole in the generated table of 24.2
++			XTRACE( "CL_LoadProgs: MISSING export %s", cdll_exports[i].name );
++
+ 			Con_Reportf( S_ERROR "%s: failed to get address of %s proc\n", __func__, cdll_exports[i].name );
+ 
+ 			// print all not found exports at once, for debug
+@@ -4007,6 +4028,8 @@ qboolean CL_LoadProgs( const char *name )
+ 		}
+ 	}
+ 
++	XTRACE( "CL_LoadProgs: base exports resolved%s", missed_exports ? " WITH HOLES" : "" );
++
+ 	if( missed_exports )
+ 	{
+ 		if( clgame.dllFuncs.pfnInit && clgame.dllFuncs.pfnRedraw && clgame.dllFuncs.pfnReset && clgame.dllFuncs.pfnUpdateClientData && clgame.dllFuncs.pfnVidInit && clgame.dllFuncs.pfnInitialize )
+@@ -4034,6 +4057,10 @@ qboolean CL_LoadProgs( const char *name )
+ 			Con_Reportf( S_WARN "%s: failed to get address of %s proc\n", __func__, cdll_new_exports[i].name );
+ 	}
+ 
++	// the first call into the client game dll: it copies the engine funcs
++	// and checks the interface version
++	XTRACE( "CL_LoadProgs: calling pfnInitialize (%p)", (void *)clgame.dllFuncs.pfnInitialize );
++
+ 	if( !clgame.dllFuncs.pfnInitialize( &gEngfuncs, CLDLL_INTERFACE_VERSION ))
+ 	{
+ 		COM_PushLibraryError( "can't init client API" );
+@@ -4043,26 +4070,36 @@ qboolean CL_LoadProgs( const char *name )
+ 		return false;
+ 	}
+ 
++	XTRACE( "CL_LoadProgs: pfnInitialize returned ok" );
++
+ 	Cvar_FullSet( "host_clientloaded", "1", FCVAR_READ_ONLY );
+ 
+ 	clgame.maxRemapInfos = 0; // will be alloc on first call CL_InitEdicts();
+ 	clgame.maxEntities = 2; // world + localclient (have valid entities not in game)
+ 
++	XTRACE( "CL_LoadProgs: CD audio, titles, particles, beams, tempents" );
++
+ 	CL_InitCDAudio( "media/cdaudio.txt" );
+ 	CL_InitTitles( "titles.txt" );
+ 	CL_InitParticles( );
+ 	CL_InitViewBeams( );
+ 	CL_InitTempEnts( );
+ 
++	XTRACE( "CL_LoadProgs: R_InitRenderAPI" );
++
+ 	if( !R_InitRenderAPI( ))	// Xash3D extension
+ 		Con_Reportf( S_WARN "%s: couldn't get render API\n", __func__ );
+ 
+ 	if( !Mobile_Init( )) // Xash3D FWGS extension: mobile interface
+ 		Con_Reportf( S_WARN "%s: couldn't get mobility API\n", __func__ );
+ 
++	XTRACE( "CL_LoadProgs: CL_InitEdicts / CL_InitClientMove" );
++
+ 	CL_InitEdicts( cl.maxclients );		// initailize local player and world
+ 	CL_InitClientMove();	// initialize pm_shared
+ 
++	XTRACE( "CL_LoadProgs: client game dll is up" );
++
+ 	// initialize game
+ 	clgame.dllFuncs.pfnInit();
+ 
+diff --git a/engine/client/cl_gameui.c b/engine/client/cl_gameui.c
+index 37de823..eccc445 100644
+--- a/engine/client/cl_gameui.c
++++ b/engine/client/cl_gameui.c
+@@ -1352,6 +1352,15 @@ qboolean UI_LoadProgs( void )
+ 
+ 	COM_GetCommonLibraryPath( LIBRARY_GAMEUI, dllpath, sizeof( dllpath ));
+ 
++	/*
++	XTRACE -- Opposing Force X boot tracing, BUILD.md section 22. Not upstream.
++	With XASH_INTERNAL_GAMELIBS this resolves to the plain name "menu", which
++	platform/misc/lib_static.c looks up in the generated tables.
++	*/
++#if XASH_XBOX
++	Xbox_Trace( "UI_LoadProgs: COM_LoadLibrary(%s)", dllpath );
++#endif
++
+ 	if(!( gameui.hInstance = COM_LoadLibrary( dllpath, false, false )))
+ 	{
+ 		string path = OS_LIB_PREFIX "menu." OS_LIB_EXT;
+@@ -1371,6 +1380,10 @@ qboolean UI_LoadProgs( void )
+ 
+ 	FS_AllowDirectPaths( false );
+ 
++#if XASH_XBOX
++	Xbox_Trace( "UI_LoadProgs: handle=%p", gameui.hInstance ); // XTRACE
++#endif
++
+ 	if(( GetMenuAPI = (MENUAPI)COM_GetProcAddress( gameui.hInstance, "GetMenuAPI" )) == NULL )
+ 	{
+ 		COM_FreeLibrary( gameui.hInstance );
+diff --git a/engine/client/cl_main.c b/engine/client/cl_main.c
+index 9adbfc5..01519e9 100644
+--- a/engine/client/cl_main.c
++++ b/engine/client/cl_main.c
+@@ -3678,24 +3678,47 @@ void CL_Init( void )
+ 	if( host.type == HOST_DEDICATED )
+ 		return; // nothing running on the client
+ 
++	/*
++	XTRACE -- Opposing Force X boot tracing, BUILD.md section 26. Not
++	upstream. The same treatment the server got in section 25. The client
++	module carries 838 renamed symbols against the server's 1, so if
++	anything resolved to the wrong copy, this is where it shows.
++	*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
++	XTRACE( "CL_Init: CL_InitLocal" );
+ 	CL_InitLocal();
+ 
++	XTRACE( "CL_Init: VID_Init (renderer and menu)" );
+ 	VID_Init();	// init video
++	XTRACE( "CL_Init: VID_Init ok" );
+ 
+ 	// unreliable buffer. unsed for unreliable commands and voice stream
+ 	MSG_Init( &cls.datagram, "cls.datagram", cls.datagram_buf, sizeof( cls.datagram_buf ));
+ 
+ 	COM_GetCommonLibraryPath( LIBRARY_CLIENT, libpath, sizeof( libpath ));
+ 
++	XTRACE( "CL_Init: CL_LoadProgs(%s)", libpath );
++
+ 	if( !CL_LoadProgs( libpath ))
+ 		Host_Error( "can't initialize %s: %s\n", libpath, COM_GetLibraryError( ));
+ 
++	XTRACE( "CL_Init: client game dll is up, S_Init" );
+ 	S_Init();	// init sound
++
++	XTRACE( "CL_Init: S_Init ok, Voice_Init" );
+ 	Voice_Init( VOICE_DEFAULT_CODEC, 3, true ); // init voice (do not open the device)
+ 
++	XTRACE( "CL_Init: ID_Init / SteamBroker_Init" );
+ 	ID_Init();
+ 	SteamBroker_Init();
+ 
++	XTRACE( "CL_Init: done" );
++
+ 	cls.build_num = 0;
+ 	cls.initialized = true;
+ 	cl.maxclients = 1; // allow to drawing player in menu
+diff --git a/engine/client/ref_common.c b/engine/client/ref_common.c
+index 6a9e06d..3dda5e8 100644
+--- a/engine/client/ref_common.c
++++ b/engine/client/ref_common.c
+@@ -515,6 +515,17 @@ static void CL_FillTriAPIFromRef( triangleapi_t *dst, const ref_interface_t *src
+ 	dst->FogParams         = src->FogParams;
+ }
+ 
++/*
++XTRACE -- Opposing Force X boot tracing, BUILD.md section 22. Not upstream.
++This is the phase after the filesystem: loading the renderer, bringing up pbgl
++and setting the video mode. See engine/platform/xbox/xbox_trace.c.
++*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
+ static qboolean R_LoadProgs( const char *name )
+ {
+ 	static ref_api_t gpEngfuncs;
+@@ -522,6 +533,8 @@ static qboolean R_LoadProgs( const char *name )
+ 
+ 	if( ref.hInstance ) R_UnloadProgs();
+ 
++	XTRACE( "R_LoadProgs: COM_LoadLibrary(%s)", name );
++
+ 	FS_AllowDirectPaths( true );
+ 	if( !( ref.hInstance = COM_LoadLibrary( name, false, true )))
+ 	{
+@@ -532,6 +545,8 @@ static qboolean R_LoadProgs( const char *name )
+ 
+ 	FS_AllowDirectPaths( false );
+ 
++	XTRACE( "R_LoadProgs: handle=%p", ref.hInstance );
++
+ 	if( !( GetRefAPI = (REFAPI)COM_GetProcAddress( ref.hInstance, GET_REF_API )))
+ 	{
+ 		Con_Reportf( "%s: can't find GetRefAPI entry point in %s\n", __func__, name );
+@@ -549,12 +564,19 @@ static qboolean R_LoadProgs( const char *name )
+ 
+ 	refState.developer = host_developer.value;
+ 
++	// this is the one that brings up pbkit/pbgl and sets the video mode,
++	// through R_Init_Video -> GL_CreateContext in platform/xbox/vid_xbox.c
++	XTRACE( "R_LoadProgs: GetRefAPI ok, calling the renderer's R_Init" );
++
+ 	if( !ref.dllFuncs.R_Init( ))
+ 	{
++		XTRACE( "R_LoadProgs: the renderer's R_Init said no" );
+ 		Con_Reportf( "%s: can't init renderer!\n", __func__ ); //, ref.dllFuncs.R_GetInitError() );
+ 		return false;
+ 	}
+ 
++	XTRACE( "R_LoadProgs: renderer up" );
++
+ 	Cvar_FullSet( "host_refloaded", "1", FCVAR_READ_ONLY );
+ 	ref.initialized = true;
+ 
+diff --git a/engine/common/filesystem_engine.c b/engine/common/filesystem_engine.c
+index 71c138c..12b2e49 100644
+--- a/engine/common/filesystem_engine.c
++++ b/engine/common/filesystem_engine.c
+@@ -222,13 +222,27 @@ static void FS_UnloadProgs( void )
+ #define FILESYSTEM_STDIO_DLL "filesystem_stdio." OS_LIB_EXT
+ #endif
+ 
++/*
++XTRACE -- Opposing Force X boot tracing, BUILD.md section 20. Not upstream.
++See engine/platform/xbox/xbox_trace.c.
++*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
+ static qboolean FS_LoadProgs( void )
+ {
+ 	const char *name = FILESYSTEM_STDIO_DLL;
+ 	FSAPI GetFSAPI;
+ 
++	XTRACE( "FS_LoadProgs: COM_LoadLibrary(%s)", name );
++
+ 	fs_hInstance = COM_LoadLibrary( name, false, true );
+ 
++	XTRACE( "FS_LoadProgs: handle=%p", fs_hInstance );
++
+ 	if( !fs_hInstance )
+ 	{
+ 		Sys_Error( "%s: can't load filesystem library %s: %s\n", __func__, name, COM_GetLibraryError() );
+@@ -257,6 +271,7 @@ static qboolean FS_LoadProgs( void )
+ 	}
+ 
+ 	Con_DPrintf( "%s: filesystem_stdio successfully loaded\n", __func__ );
++	XTRACE( "FS_LoadProgs: filesystem_stdio ready" );
+ 	return true;
+ }
+ 
+@@ -441,11 +456,16 @@ void FS_Init( void )
+ 	char rodir[MAX_OSPATH], rootdir[MAX_OSPATH];
+ 	rodir[0] = rootdir[0] = 0;
+ 
++	XTRACE( "FS_Init: FS_DetermineRootDirectory (mounts D: on this target)" );
++
+ 	if( !FS_DetermineRootDirectory( rootdir, sizeof( rootdir )) || COM_StringEmpty( rootdir ))
+ 	{
+ 		Sys_Error( "couldn't determine current directory (empty string)" );
+ 		return;
+ 	}
++
++	XTRACE( "FS_Init: rootdir=%s", rootdir );
++
+ 	COM_FixSlashes( rootdir );
+ 	COM_StripDirectorySlash( rootdir );
+ 
+@@ -462,6 +482,8 @@ void FS_Init( void )
+ 			Q_strncpy( gamedir, host.default_gamedir, sizeof( gamedir )); // gamedir == basedir
+ 	}
+ 
++	XTRACE( "FS_Init: rodir=%s gamedir=%s", rodir, gamedir );
++
+ 	FS_LoadProgs();
+ 
+ 	// TODO: this function will cause engine to stop in case of fail
+@@ -471,12 +493,16 @@ void FS_Init( void )
+ 	// and this better be reworked at some point
+ 	g_fsapi.SetCurrentDirectory( rootdir );
+ 
++	XTRACE( "FS_Init: InitStdio" );
++
+ 	if( !g_fsapi.InitStdio( true, rootdir, host.default_gamedir, gamedir, rodir ))
+ 	{
+ 		Sys_Error( "Can't init filesystem_stdio!\n" );
+ 		return;
+ 	}
+ 
++	XTRACE( "FS_Init: filesystem mounted" );
++
+ 	Cmd_AddRestrictedCommand( "fs_rescan", FS_Rescan_f, "rescan filesystem search pathes" );
+ 	Cmd_AddRestrictedCommand( "fs_path", FS_Path_f_, "show filesystem search pathes" );
+ 	Cmd_AddRestrictedCommand( "fs_clearpaths", FS_ClearPaths_f, "clear filesystem search pathes" );
+diff --git a/engine/common/host.c b/engine/common/host.c
+index c3a8bc8..009bd7e 100644
+--- a/engine/common/host.c
++++ b/engine/common/host.c
+@@ -42,6 +42,17 @@ GNU General Public License for more details.
+ host_parm_t host;	// host parms
+ static jmp_buf return_from_main_buf;
+ 
++/*
++XTRACE -- Opposing Force X boot tracing, BUILD.md section 20. Not upstream.
++Xbox_Trace() writes to screen, serial and D:\xash-boot.log at once; see
++engine/platform/xbox/xbox_trace.c. Compiles away everywhere else.
++*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
+ /*
+ ===============
+ Host_ExitInMain
+@@ -988,8 +999,13 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ 	// some commands may turn engine into infinite loop,
+ 	// e.g. xash.exe +game xash -game xash
+ 	// so we clear all cmd_args, but leave dbg states as well
++	XTRACE( "Host_InitCommon: enter, argc=%d basedir=%s", argc, basedir );
++
+ 	Sys_ParseCommandLine( argc, (const char **)argv );
++	XTRACE( "Host_InitCommon: Sys_ParseCommandLine ok" );
++
+ 	Host_DetermineExecutableName( exename, exename_size );
++	XTRACE( "Host_InitCommon: exename=%s", exename );
+ 
+ 	if( !Sys_CheckParm( "-disablehelp" ))
+ 	{
+@@ -1013,9 +1029,11 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ 		host.type = HOST_NORMAL;
+ #endif
+ 
++	XTRACE( "Host_InitCommon: Memory_Init" );
+ 	Memory_Init(); // init memory subsystem
+ 
+ 	host.mempool = Mem_AllocPool( "Zone Engine" );
++	XTRACE( "Host_InitCommon: Zone Engine pool ok" );
+ 
+ 	host.allow_console = DEFAULT_ALLOWCONSOLE || DEFAULT_DEV > 0;
+ 
+@@ -1065,8 +1083,10 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ 	if( Sys_GetIntFromCmdLine( "-sys_ticrate", &ticrate ))
+ 		Cvar_DirectSetValue( &sys_ticrate, bound( MIN_FPS, ticrate, MAX_FPS_HARD ));
+ 
++	XTRACE( "Host_InitCommon: Cmd/Cvar ok, Sys_InitLog" );
+ 	Sys_InitLog();
+ 	Con_Init(); // early console running to catch all the messages
++	XTRACE( "Host_InitCommon: Con_Init ok" );
+ 
+ 	if( !Sys_CheckParm( "-noch" ))
+ 		Sys_SetupCrashHandler( argv[0] );
+@@ -1079,8 +1099,13 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ #if XASH_DEDICATED
+ 	Platform_SetupSigtermHandling();
+ #endif
++	XTRACE( "Host_InitCommon: Platform_Init (SDL2 on this target)" );
+ 	Platform_Init( Host_IsDedicated( ) || developer >= DEV_EXTENDED );
++	XTRACE( "Host_InitCommon: Platform_Init ok" );
++
++	XTRACE( "Host_InitCommon: FS_Init" );
+ 	FS_Init();
++	XTRACE( "Host_InitCommon: FS_Init ok" );
+ 
+ 	// print current developer level to simplify processing users feedback
+ 	if( developer > 0 )
+@@ -1103,15 +1128,20 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ 	Cmd_AddRestrictedCommand( "host_writeconfig", Host_WriteConfig, "save current configuration" );
+ #endif
+ 
++	XTRACE( "Host_InitCommon: Image_Init / Sound_Init" );
+ 	Image_Init();
+ 	Sound_Init();
++	XTRACE( "Host_InitCommon: Image/Sound ok" );
+ 
+ #if XASH_ENGINE_TESTS
+ 	if( Sys_CheckParm( "-runtests" ))
+ 		Host_RunTests( 1 );
+ #endif
+ 
++	XTRACE( "Host_InitCommon: FS_LoadGameInfo" );
+ 	FS_LoadGameInfo();
++	XTRACE( "Host_InitCommon: gamedir=%s dll_path=%s", GI->gamefolder, GI->dll_path );
++
+ 	Host_CheckGameLibraries();
+ 	Cvar_PostFSInit();
+ 
+@@ -1121,12 +1151,18 @@ static void Host_InitCommon( int argc, char **argv, const char *progname, qboole
+ 	if( !FS_FileExists( "gfx/conchars", false ))
+ 		Sys_Error( "%s: couldn't load gfx.wad\n", __func__ );
+ 
++	XTRACE( "Host_InitCommon: gfx/conchars found" );
++
+ 	Host_InitDecals ();	// reload decals
+ 
+ 	HPAK_Init();
+ 
++	XTRACE( "Host_InitCommon: decals/HPAK ok, IN_Init" );
++
+ 	IN_Init();
+ 	Key_Init();
++
++	XTRACE( "Host_InitCommon: done" );
+ }
+ 
+ static void Host_FreeCommon( void )
+@@ -1156,10 +1192,18 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+ 	if( setjmp( return_from_main_buf ))
+ 		return error_on_exit;
+ 
++	XTRACE( "Host_Main: enter" );
++
+ 	host.starttime = Platform_DoubleTime();
+ 
+ 	Host_InitCommon( argc, argv, progname, bChangeGame, exename, sizeof( exename ));
+ 
++	XTRACE( "Host_Main: Host_InitCommon returned" );
++
++#if XASH_XBOX
++	Xbox_StackReport( "after Host_InitCommon" );
++#endif
++
+ 	// init commands and vars
+ 	if( host_developer.value >= DEV_EXTENDED )
+ 	{
+@@ -1199,10 +1243,21 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+ #endif
+ 		FCVAR_READ_ONLY, "indicates if engine was compiled with extended msurface_t struct" );
+ 
++	XTRACE( "Host_Main: Mod_Init" );
+ 	Mod_Init();
++
++	// XTRACE -- the boot spends most of its time somewhere in here; on this
++	// target NET_Init brings up lwip over nforceif and, with the console on
++	// DHCP, waits for a lease. BUILD.md 24.5.
++	XTRACE( "Host_Main: NET_Init" );
+ 	NET_Init();
++	XTRACE( "Host_Main: NET_Init ok" );
++
+ 	NET_InitMasters();
++	XTRACE( "Host_Main: NET_InitMasters ok" );
++
+ 	Netchan_Init();
++	XTRACE( "Host_Main: Netchan_Init ok" );
+ 
+ 	// allow to change game from the console
+ 	if( pChangeGame != NULL && Sys_CanRestart( ))
+@@ -1215,8 +1270,13 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+ 		Cvar_Get( "host_allow_changegame", "0", FCVAR_READ_ONLY, "allows to change games" );
+ 	}
+ 
++	XTRACE( "Host_Main: SV_Init" );
+ 	SV_Init();
++	XTRACE( "Host_Main: SV_Init ok" );
++
++	XTRACE( "Host_Main: CL_Init (loads ref_gl and menu)" );
+ 	CL_Init();
++	XTRACE( "Host_Main: CL_Init ok" );
+ 
+ 	HTTP_Init();
+ 	SoundList_Init();
+@@ -1272,10 +1332,20 @@ int EXPORT Host_Main( int argc, char **argv, const char *progname, int bChangeGa
+ 		break;
+ 	}
+ 
++	XTRACE( "Host_Main: post-init configs done" );
++
+ 	host.change_game = false;	// done
+ 	Cbuf_ExecStuffCmds();	// execute stuffcmds (commandline)
+ 	SCR_CheckStartupVids();	// must be last
+ 
++	XTRACE( "Host_Main: entering frame loop -- the engine is up" );
++
++#if XASH_XBOX
++	// XTRACE -- from here on silence is normal: a running game does not
++	// print, and the boot watchdog would take that for a hang.
++	Xbox_TraceWatchdogDisarm();
++#endif
++
+ 	if( Sys_GetParmFromCmdLine( "-timedemo", demoname ))
+ 		Cbuf_AddTextf( "timedemo %s\n", demoname );
+ 
+diff --git a/engine/common/launcher.c b/engine/common/launcher.c
+index 82c270d..48c742b 100644
+--- a/engine/common/launcher.c
++++ b/engine/common/launcher.c
+@@ -40,8 +40,38 @@ static void Sys_ChangeGame( const char *progname )
+ int main( int argc, char **argv )
+ {
+ #if XASH_XBOX
++	// XTRACE -- Opposing Force X, BUILD.md 20. Not upstream.
++	Xbox_Trace( "main: entered, argc=%d argv=%p argv0=%s", argc, (void *)argv,
++		( argc > 0 && argv && argv[0] ) ? argv[0] : "(null)" );
++
+ 	XVideoSetMode(640, 480, 32, REFRESH_DEFAULT);
++
++	// XTRACE -- the call above wipes the framebuffer, so the screen only
++	// starts keeping trace lines from here on. The log file has them all.
++	Xbox_Trace( "main: XVideoSetMode 640x480x32 done" );
++
+ 	szArgc = Xbox_GetArgv( argc, argv, &szArgv );
++
++	// XTRACE
++	Xbox_Trace( "main: Xbox_GetArgv -> argc=%d argv=%p", szArgc, (void *)szArgv );
++
++	// XTRACE -- and then whatever D:\xash.cmd says, because nxdk gives a
++	// title no arguments at all. BUILD.md 24.4.
++	szArgc = Xbox_AppendCmdlineFile( szArgc, szArgv, &szArgv );
++
++	/*
++	XTRACE -- paint the stack here, as shallow as the boot ever gets, so the
++	watermark later covers everything Host_Main does. BUILD.md 27.
++
++	-nostackpaint turns it off. Painting is a measurement that changes what it
++	measures: a bug that depends on uninitialised stack garbage behaves
++	differently once the garbage is a known pattern. Section 28.4 checks that
++	it did not mask anything here, and this switch is how that check is made
++	without rebuilding.
++	*/
++	if( !Xbox_CmdlineHas( "-nostackpaint" ))
++		Xbox_StackPaint();
++	Xbox_Trace( "main: calling Host_Main, gamedir=%s", XASH_GAMEDIR );
+ #elif XASH_PSVITA
+ 	// inject -dev -console into args if required
+ 	szArgc = PSVita_GetArgv( argc, argv, &szArgv );
+diff --git a/engine/common/net_ws.c b/engine/common/net_ws.c
+index 0afe5bc..fe2cd88 100644
+--- a/engine/common/net_ws.c
++++ b/engine/common/net_ws.c
+@@ -2003,15 +2003,35 @@ void NET_Init( void )
+ 		return;
+ 	}
+ #elif XASH_XBOX
++	/*
++	XTRACE -- Opposing Force X, BUILD.md section 25. Not upstream.
++	nxNetInit with NX_NET_DHCP waits for a lease, and it ran before the
++	-noip check further down, so -noip did nothing for it: 9 of the 14
++	seconds of every boot were spent right here. On this target -noip now
++	means "do not bring the stack up at all", which is the only reading that
++	saves the wait -- and the one that matters while iterating.
++	*/
++	if( Sys_CheckParm( "-noip" ))
++	{
++		Xbox_Trace( "NET_Init: -noip, skipping nxNetInit (no DHCP wait)" );
++		Con_Printf( "Xbox networking disabled by -noip\n" );
++	}
++	else
+ 	{
+ 		nx_net_parameters_t params = { 0 };
+ 		params.ipv4_mode = NX_NET_DHCP;
+ 		params.ipv6_mode = NX_NET_AUTO;
++
++		Xbox_Trace( "NET_Init: nxNetInit, DHCP -- this is the slow one" );
++
+ 		if( nxNetInit( &params ) < 0 )
+ 		{
++			Xbox_Trace( "NET_Init: nxNetInit failed" );
+ 			Con_Printf( S_ERROR "nxNetInit failed.\n" );
+ 			return;
+ 		}
++
++		Xbox_Trace( "NET_Init: nxNetInit ok" );
+ 		Con_Printf( "Xbox networking initialised. \n" );
+ 	}
+ #endif
+diff --git a/engine/common/sys_con.c b/engine/common/sys_con.c
+index 6d5d6b8..4be8c6d 100644
+--- a/engine/common/sys_con.c
++++ b/engine/common/sys_con.c
+@@ -288,7 +288,16 @@ static void Sys_PrintStdout( const char *logtime, size_t logtime_len, const char
+ 		else
+ 			Q_strncpy( line, buf, sizeof( line ));
+ 
+-		Xbox_SerialPrint( line );
++		// XTRACE -- Opposing Force X, BUILD.md section 20. Not upstream.
++		// The console goes to the screen and to D:\xash-boot.log as well, so
++		// there is a readable record without a serial cable.
++		Xbox_TraceRaw( line );
++
++		// Xbox_SerialPutc() spins up to 100000 times per character waiting for
++		// a transmitter that is not there on a console with no UART fitted, and
++		// this runs for every Con_Printf. Ask first.
++		if( Xbox_TraceSerialAvailable( ))
++			Xbox_SerialPrint( line );
+ 	}
+ #endif
+ }
+diff --git a/engine/common/system.c b/engine/common/system.c
+index aedc4af..32528d7 100644
+--- a/engine/common/system.c
++++ b/engine/common/system.c
+@@ -423,6 +423,9 @@ void Sys_Error( const char *error, ... )
+ 
+ #if XASH_XBOX
+ 	debugPrint( "*** Sys_Error: %s\n", text );
++	// XTRACE -- Opposing Force X, BUILD.md section 20. Not upstream: put it in
++	// D:\xash-boot.log too, which survives the hang that follows this.
++	Xbox_Trace( "*** Sys_Error: %s", text );
+ #endif
+ 
+ 	if( !Host_IsDedicated() )
+@@ -458,7 +461,12 @@ void Sys_Quit( const char *reason )
+ {
+ 	Host_ShutdownWithReason( reason );
+ #if XASH_XBOX
+-	for( ;; ) Platform_Sleep( 1000 );
++	// XTRACE -- Opposing Force X, BUILD.md section 21. Not upstream.
++	// Was: for( ;; ) Platform_Sleep( 1000 ); -- a title that finishes on a
++	// console has nowhere to return to, so this sat there until the power
++	// button. Going back to the dashboard instead brings the network and the
++	// FTP server back, which is how the boot log gets collected at all.
++	Xbox_ReturnToDashboard( reason );
+ #else
+ 	Host_ExitInMain();
+ #endif
+diff --git a/engine/eiface.h b/engine/eiface.h
+index 9e0235c..8b220dd 100644
+--- a/engine/eiface.h
++++ b/engine/eiface.h
+@@ -34,7 +34,23 @@
+ // This is conveniently done for them in extdll.h
+ //
+ 
+-#if defined(_WIN32) && !XASH_XBOX
++/*
++XTRACE -- Opposing Force X, BUILD.md section 28. Not upstream.
++Was: #if defined(_WIN32) && !XASH_XBOX
++
++DLLEXPORT is used in exactly one place in this engine -- sv_game.c:40, the
++GIVEFNPTRSTODLL typedef. Excluding the Xbox from __stdcall made the engine call
++GiveFnptrsToDll as cdecl, but the game dll comes from hlsdk built with its own
++headers, where dlls/h_export.cpp:47 defines EXPORT2 as WINAPI. The symbol says
++so out loud: _GiveFnptrsToDll@8.
++
++So both sides cleaned the same 8 bytes of arguments: the callee with 'ret 8'
++and the caller with 'addl $8, %esp'. ESP came back 8 too high; SV_LoadProgs has
++no frame pointer, so the skew rode all the way to its 'retl', which then popped
++garbage. Everything before that worked because the function keeps almost
++nothing on the stack. See BUILD.md 28.2.
++*/
++#if defined(_WIN32)
+ #define DLLEXPORT __stdcall
+ #else
+ #define DLLEXPORT /* */
+diff --git a/engine/platform/sdl2/host_sdl2.c b/engine/platform/sdl2/host_sdl2.c
+index ee9a45d..ca931a8 100644
+--- a/engine/platform/sdl2/host_sdl2.c
++++ b/engine/platform/sdl2/host_sdl2.c
+@@ -358,6 +358,29 @@ static void SDLash_EventHandler( SDL_Event *event )
+ 	case SDL_CONTROLLERAXISMOTION:
+ 	case SDL_CONTROLLERBUTTONDOWN:
+ 	case SDL_CONTROLLERBUTTONUP:
++#if XASH_XBOX
++		/*
++		XTRACE -- Opposing Force X, BUILD.md section 21. Not upstream.
++		START+BACK together goes back to the dashboard. On a console there is
++		no Alt-F4 and no keyboard, and until the menu works this is the only
++		way to leave a healthy engine without the power button. Tracked here
++		rather than in joy_sdl2.c because this is where the event arrives
++		before anything is allowed to swallow it.
++		*/
++		if( event->type == SDL_CONTROLLERBUTTONDOWN || event->type == SDL_CONTROLLERBUTTONUP )
++		{
++			static qboolean xbox_start_held, xbox_back_held;
++			qboolean down = event->type == SDL_CONTROLLERBUTTONDOWN;
++
++			if( event->cbutton.button == SDL_CONTROLLER_BUTTON_START )
++				xbox_start_held = down;
++			else if( event->cbutton.button == SDL_CONTROLLER_BUTTON_BACK )
++				xbox_back_held = down;
++
++			if( xbox_start_held && xbox_back_held )
++				Xbox_ReturnToDashboard( "START+BACK" );
++		}
++#endif
+ 	case SDL_CONTROLLERDEVICEADDED:
+ 	case SDL_CONTROLLERDEVICEREMOVED:
+ #if SDL_VERSION_ATLEAST( 2, 0, 14 )
+diff --git a/engine/platform/xbox/vid_xbox.c b/engine/platform/xbox/vid_xbox.c
+index 06c66e8..cc1fcc9 100644
+--- a/engine/platform/xbox/vid_xbox.c
++++ b/engine/platform/xbox/vid_xbox.c
+@@ -245,12 +245,19 @@ qboolean R_Init_Video( ref_graphic_apis_t type )
+ 	gl_attribs[REF_GL_CONTEXT_MAJOR_VERSION] = 1;
+ 	gl_attribs[REF_GL_CONTEXT_MINOR_VERSION] = 2;
+ 
++	// XTRACE -- Opposing Force X, BUILD.md section 22. Not upstream.
++	// pbgl talks to the GPU directly through pbkit; if the console dies here
++	// it dies with the framebuffer in an unknown state and debugPrint may not
++	// survive, so the log on disc is the only witness.
++	Xbox_Trace( "R_Init_Video: pb_size 2 MB, pbgl_init" );
++
+ 	pb_size( 2 * 1024 * 1024 ); // 2MB for pushbuffer
+ 
+ 	int err = pbgl_init( GL_TRUE );
+-	
++
+ 	if( err < 0 )
+ 	{
++		Xbox_Trace( "R_Init_Video: pbgl_init failed: %d", err );
+ 		Sys_Error( S_ERROR "pbgl_init failed: %d\n", err );
+ 		return false;
+ 	}
+@@ -258,13 +265,20 @@ qboolean R_Init_Video( ref_graphic_apis_t type )
+ 	pbgl_initialized = true;
+ 	Con_Printf( "PBGL initialized successfully\n" );
+ 
++	Xbox_Trace( "R_Init_Video: pbgl up, VID_SetMode" );
++
+ 	if( !(retval = VID_SetMode()) )
+ 	{
++		Xbox_Trace( "R_Init_Video: VID_SetMode said no" );
+ 		return retval;
+ 	}
+ 
++	Xbox_Trace( "R_Init_Video: mode set, GL_InitExtensions" );
++
+ 	ref.dllFuncs.GL_InitExtensions();
+ 
++	Xbox_Trace( "R_Init_Video: done" );
++
+ 	host.renderinfo_changed = false;
+ 
+ 	return true;
+diff --git a/engine/server/sv_game.c b/engine/server/sv_game.c
+index 5214f0f..a06ce59 100644
+--- a/engine/server/sv_game.c
++++ b/engine/server/sv_game.c
+@@ -5233,13 +5233,30 @@ qboolean SV_LoadProgs( const char *name )
+ 	svgame.globals = &gpGlobals;
+ 	svgame.mempool = Mem_AllocPool( "Server Edicts Zone" );
+ 
++	/*
++	XTRACE -- Opposing Force X boot tracing, BUILD.md section 25. Not
++	upstream. This is the first code of the game dll that ever runs on the
++	console, so every step gets a line: which entry points resolved, and
++	which call did not come back.
++	*/
++#if XASH_XBOX
++#define XTRACE( ... ) Xbox_Trace( __VA_ARGS__ )
++#else
++#define XTRACE( ... ) ((void)0)
++#endif
++
++	XTRACE( "SV_LoadProgs: COM_LoadLibrary(%s)", name );
++
+ 	svgame.hInstance = COM_LoadLibrary( name, true, false );
+ 	if( !svgame.hInstance )
+ 	{
++		XTRACE( "SV_LoadProgs: not in the static tables" );
+ 		Mem_FreePool(&svgame.mempool);
+ 		return false;
+ 	}
+ 
++	XTRACE( "SV_LoadProgs: handle=%p", svgame.hInstance );
++
+ 	// make sure what new dll functions is cleared
+ 	memset( &svgame.dllFuncs2, 0, sizeof( svgame.dllFuncs2 ));
+ 
+@@ -5280,8 +5297,17 @@ qboolean SV_LoadProgs( const char *name )
+ 		return false;
+ 	}
+ 
++	XTRACE( "SV_LoadProgs: entry points resolved (API=%p API2=%p New=%p Give=%p)",
++		(void *)GetEntityAPI, (void *)GetEntityAPI2,
++		(void *)GiveNewDllFuncs, (void *)GiveFnptrsToDll );
++
++	// the first instruction of game code the console ever executes
++	XTRACE( "SV_LoadProgs: calling GiveFnptrsToDll" );
++
+ 	GiveFnptrsToDll( &gpEngfuncs, svgame.globals );
+ 
++	XTRACE( "SV_LoadProgs: GiveFnptrsToDll returned" );
++
+ 	// get extended callbacks
+ 	if( GiveNewDllFuncs )
+ 	{
+@@ -5297,6 +5323,8 @@ qboolean SV_LoadProgs( const char *name )
+ 
+ 	version = INTERFACE_VERSION;
+ 
++	XTRACE( "SV_LoadProgs: calling GetEntityAPI2" );
++
+ 	if( GetEntityAPI2 && GetEntityAPI2( &svgame.dllFuncs, &version ))
+ 	{
+ 		if( INTERFACE_VERSION == version )
+@@ -5323,6 +5351,8 @@ qboolean SV_LoadProgs( const char *name )
+ 		return false;
+ 	}
+ 
++	XTRACE( "SV_LoadProgs: entity API ok" );
++
+ 	SV_InitOperatorCommands();
+ 	Mod_InitStudioAPI();
+ 
+@@ -5334,6 +5364,8 @@ qboolean SV_LoadProgs( const char *name )
+ 	// grab function SV_SaveGameComment
+ 	SV_InitSaveRestore ();
+ 
++	XTRACE( "SV_LoadProgs: allocating %d edicts", GI->max_edicts );
++
+ 	svgame.globals->pStringBase = ""; // setup string base
+ 
+ 	svgame.globals->maxEntities = GI->max_edicts;
+@@ -5349,19 +5381,40 @@ qboolean SV_LoadProgs( const char *name )
+ 	Cvar_FullSet( "host_gameloaded", "1", FCVAR_READ_ONLY );
+ 	SV_AllocStringPool();
+ 
++	XTRACE( "SV_LoadProgs: calling pfnGetGameDescription" );
++
+ 	// fire once
+ 	Con_Printf( "Dll loaded for game ^2\"%s\"\n", svgame.dllFuncs.pfnGetGameDescription( ));
+ 
++	XTRACE( "SV_LoadProgs: calling pfnGameInit" );
++
+ 	// all done, initialize game
+ 	svgame.dllFuncs.pfnGameInit();
+ 
++	XTRACE( "SV_LoadProgs: pfnGameInit returned, SV_InitClientMove" );
++
++#if XASH_XBOX
++	Xbox_StackReport( "after pfnGameInit" );
++#endif
++
+ 	// initialize pm_shared
+ 	SV_InitClientMove();
+ 
+ 	Delta_Init ();
+ 
++	XTRACE( "SV_LoadProgs: calling pfnRegisterEncoders" );
++
+ 	// register custom encoders
+ 	svgame.dllFuncs.pfnRegisterEncoders();
+ 
++	XTRACE( "SV_LoadProgs: server game dll is up" );
++
++	// XTRACE -- the last line the console ever printed was the one above, and
++	// the next trace is two function returns away with no call in between.
++	// This says how close the stack came to the floor by that point.
++#if XASH_XBOX
++	Xbox_StackReport( "at end of SV_LoadProgs" );
++#endif
++
+ 	return true;
+ }
+diff --git a/engine/server/sv_init.c b/engine/server/sv_init.c
+index 502b1f9..c0d9baf 100644
+--- a/engine/server/sv_init.c
++++ b/engine/server/sv_init.c
+@@ -740,6 +740,13 @@ qboolean SV_InitGame( qboolean silent )
+ 
+ 	COM_GetCommonLibraryPath( LIBRARY_SERVER, dllpath, sizeof( dllpath ));
+ 
++	// XTRACE -- Opposing Force X, BUILD.md section 25. Not upstream. With
++	// XASH_INTERNAL_GAMELIBS this is the bare name "server", looked up in
++	// the tables xbox.py generates.
++#if XASH_XBOX
++	Xbox_Trace( "SV_InitGame: SV_LoadProgs(%s)", dllpath );
++#endif
++
+ 	if( !SV_LoadProgs( dllpath ))
+ 	{
+ 		if( !silent )
+@@ -749,6 +756,13 @@ qboolean SV_InitGame( qboolean silent )
+ 		return false; // failed to loading server.dll
+ 	}
+ 
++	// XTRACE -- BUILD.md section 26. The previous run ended at the last line
++	// of SV_LoadProgs, with nothing between it and "SV_Init: done" but two
++	// function returns. These two lines split that gap in half.
++#if XASH_XBOX
++	Xbox_Trace( "SV_InitGame: SV_LoadProgs returned" );
++#endif
++
+ 	// client frames will be allocated in SV_ClientConnect
+ 	return true;
+ }
+diff --git a/engine/server/sv_main.c b/engine/server/sv_main.c
+index 26752a3..49cf34f 100644
+--- a/engine/server/sv_main.c
++++ b/engine/server/sv_main.c
+@@ -1008,9 +1008,29 @@ void SV_Init( void )
+ 
+ 	Cvar_FullSet( "sv_version", versionString, FCVAR_READ_ONLY );
+ 
++	/*
++	XTRACE -- Opposing Force X boot tracing, BUILD.md section 25. Not
++	upstream. Everything above this point is cvar registration; from here on
++	the server touches the game dll for the first time.
++	*/
++#if XASH_XBOX
++	Xbox_Trace( "SV_Init: cvars done, SV_InitFilter" );
++#endif
+ 	SV_InitFilter();
++
++#if XASH_XBOX
++	Xbox_Trace( "SV_Init: SV_ClearGameState" );
++#endif
+ 	SV_ClearGameState ();	// delete all temporary *.hl files
++
++#if XASH_XBOX
++	Xbox_Trace( "SV_Init: SV_InitGame (this loads the server game dll)" );
++#endif
+ 	SV_InitGame( GI->gamemode != GAME_SINGLEPLAYER_ONLY );
++
++#if XASH_XBOX
++	Xbox_Trace( "SV_Init: done" );
++#endif
+ }
+ 
+ /*

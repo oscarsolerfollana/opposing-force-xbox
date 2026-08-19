@@ -1,0 +1,454 @@
+diff --git a/src/array.c b/src/array.c
+index 677d0ee..2a1bf30 100644
+--- a/src/array.c
++++ b/src/array.c
+@@ -31,7 +31,16 @@ static inline GLuint gltype_to_nvtype(const GLenum gltype) {
+   }
+ }
+ 
+-static inline void array_set(const GLenum index, const GLenum type, const GLsizei size, const GLsizei stride, const void *data) {
++static inline GLuint gltype_bytes(const GLenum gltype) {
++  switch(gltype) {
++    case GL_FLOAT:         return 4;
++    case GL_SHORT:         return 2;
++    case GL_UNSIGNED_BYTE: return 1;
++    default:               return 0;
++  }
++}
++
++static inline void array_set(const GLenum index, const GLenum type, const GLsizei size, GLsizei stride, const void *data) {
+   varray_state_t *arr;
+ 
+   // don't forget about multitexturing
+@@ -40,6 +49,22 @@ static inline void array_set(const GLenum index, const GLenum type, const GLsize
+   else
+     arr = &pbgl.varray[index];
+ 
++  /* ##########################################################################
++     NOT UPSTREAM pbGL. Opposing Force X, BUILD.md 47.
++
++     In OpenGL, stride 0 does not mean "no stride", it means "tightly packed":
++     the implementation has to compute size * sizeof(type) itself. pbgl passed
++     the zero straight into NV097_SET_VERTEX_DATA_ARRAY_FORMAT_STRIDE, and a
++     zero stride on the NV2A makes every vertex fetch the same element.
++
++     Xash's studio renderer hands exactly that: stride 12 for the positions
++     but stride 0 for texcoords and colours (gl_studio.c:2202, 2207), which is
++     legal GL and turned every model's texture coordinates into one repeated
++     value here.
++     ######################################################################## */
++  if (stride == 0)
++    stride = size * (GLsizei)gltype_bytes(type);
++
+   arr->type = type;
+   arr->size = size;
+   arr->stride = stride;
+@@ -247,6 +272,30 @@ GL_API void glDrawElements(GLenum prim, GLsizei count, GLenum idxtype, const voi
+   pbgl_state_flush();
+   pbgl_array_flush_all();
+ 
++  /* XTRACE -- BUILD.md 47: studio models are invisible and this is the call
++     that should be drawing them. Every ~1800th (about one a second at 60 fps
++     with the load c1a0 puts on it) plus the first two, so the log says what
++     the GPU was actually told: which arrays are live, their strides, and
++     where their data lives -- the addresses matter because pbgl masks them
++     to 26 bits for the DMA. */
++  {
++    extern void Xbox_Trace(const char *fmt, ...);
++    static unsigned n;
++
++    if (n < 2 || (n % 1800) == 0) {
++      const varray_state_t *pos = &pbgl.varray[VARR_POSITION];
++      const varray_state_t *col = &pbgl.varray[VARR_COLOR1];
++      const varray_state_t *tc  = &pbgl.tex[pbgl.active_tex_cl].varray;
++
++      Xbox_Trace("gl draw#%u: %d idx, pos[en %d sz %d st %d @%p] tc[en %d sz %d st %d @%p] col[en %d sz %d st %d @%p]",
++        n, count,
++        pos->enabled, pos->size, pos->stride, pos->data,
++        tc->enabled,  tc->size,  tc->stride,  tc->data,
++        col->enabled, col->size, col->stride, col->data);
++    }
++    n++;
++  }
++
+   GLuint *p = pb_begin();
+   p = push_command_parameter(p, NV097_SET_BEGIN_END, prim);
+ 
+diff --git a/src/memory.c b/src/memory.c
+index ff3115b..6a9d715 100644
+--- a/src/memory.c
++++ b/src/memory.c
+@@ -19,18 +19,59 @@ void pbgl_mem_shutdown(void) {
+ 
+ }
+ 
++/* ###########################################################################
++   NOT UPSTREAM pbGL. Opposing Force X, BUILD.md 40.
++
++   This allocator is the prime suspect for the machine-wide freeze, and it
++   was completely blind. Every texture in the game comes through here, into
++   physically contiguous pages below PBGL_MAXRAM (0x03FFAFFF -- 64 MB, no
++   matter that the console has 128), and nothing said how much was in use or
++   how long the search took. Section 40 reconstructed 50 MB of that 64 in
++   use at the freeze, with the gaps between uploads climbing 177 -> 196 ->
++   806 ms as the region filled and fragmented.
++
++   So: a running total, and a line whenever one allocation takes long enough
++   to matter. Silent when things are healthy; when they are not, it names
++   the allocation and says how full the pool was.
++   ######################################################################## */
++extern void Xbox_Trace(const char *fmt, ...);
++
++#define PBGL_ALLOC_SLOW_MS 100u
++
++static GLuint pbgl_mem_live;   // bytes currently handed out
++static GLuint pbgl_mem_peak;
++static GLuint pbgl_mem_allocs;
++
+ void *pbgl_mem_alloc(GLuint size) {
++  const DWORD t0 = GetTickCount();
+   void *p = MmAllocateContiguousMemoryEx(size, 0, PBGL_MAXRAM, MEM_ALIGNMENT, PAGE_WRITECOMBINE | PAGE_READWRITE);
++  const DWORD dt = GetTickCount() - t0;
++
+   if (!p) {
+     pbgl_debug_log("mem: failed to alloc %u bytes", size);
++    Xbox_Trace("pbgl mem: FAILED %u KB after %u ms, live %u KB in %u allocs",
++      size / 1024u, (unsigned)dt, pbgl_mem_live / 1024u, pbgl_mem_allocs);
+     return NULL;
+   }
++
++  pbgl_mem_live += size;
++  pbgl_mem_allocs++;
++  if (pbgl_mem_live > pbgl_mem_peak)
++    pbgl_mem_peak = pbgl_mem_live;
++
++  // the interesting ones: a contiguous-page search that had to work for it
++  if (dt >= PBGL_ALLOC_SLOW_MS) {
++    Xbox_Trace("pbgl mem: slow alloc %u KB took %u ms, live %u KB / peak %u KB in %u allocs",
++      size / 1024u, (unsigned)dt, pbgl_mem_live / 1024u, pbgl_mem_peak / 1024u, pbgl_mem_allocs);
++  }
++
+   return p;
+ }
+ 
+ void pbgl_mem_free(void *ptr) {
+-  if (ptr)
++  if (ptr) {
+     MmFreeContiguousMemory(ptr);
++  }
+ }
+ 
+ // SDL_memcpySSE from SDL2
+diff --git a/src/misc.c b/src/misc.c
+index 64ed1a3..3710171 100644
+--- a/src/misc.c
++++ b/src/misc.c
+@@ -1,4 +1,5 @@
+ #include <pbkit/pbkit.h>
++#include <windows.h> // GetTickCount, for the bounded glFinish (BUILD.md 39)
+ 
+ #include "GL/gl.h"
+ #include "GL/glext.h"
+@@ -67,8 +68,23 @@ GL_API void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum
+ // TODO: figure out how the fuck to do this properly
+ 
+ GL_API void glFinish(void) {
++  // NOT UPSTREAM pbGL: bounded like the waits in pbgl.c (Opposing Force X,
++  // BUILD.md 39) -- a wedged GPU must cost a log line, not the machine.
++  extern void Xbox_Trace(const char *fmt, ...);
++  unsigned n = 0;
++  DWORD t0 = 0;
++  int timing = 0;
++
+   glFlush();
+-  while (pb_busy());
++  while (pb_busy()) {
++    if ((++n & 0xFFFFu) == 0) {
++      if (!timing) { t0 = GetTickCount(); timing = 1; }
++      else if (GetTickCount() - t0 > 5000u) {
++        Xbox_Trace("pbgl: wait timeout (5000 ms) at glFinish");
++        break;
++      }
++    }
++  }
+ }
+ 
+ GL_API void glFlush(void) {
+diff --git a/src/pbgl.c b/src/pbgl.c
+index 8b9bac8..666f2f4 100644
+--- a/src/pbgl.c
++++ b/src/pbgl.c
+@@ -24,9 +24,34 @@
+ static GLboolean pbkit_initialized = GL_FALSE;
+ static GLboolean pbkit_do_deinit = GL_FALSE;
+ 
++/* ###########################################################################
++   NOT UPSTREAM pbGL. Opposing Force X, BUILD.md 39: bounded GPU waits.
++   A wedged GPU turns any of these spins into a silent forever -- the gman
++   hang of BUILD.md 38 froze the whole console with zero evidence. Five
++   seconds without progress trades "frozen machine, no witness" for a log
++   line and a broken frame. Xbox_Trace lives in the engine this lib links
++   into (engine/platform/xbox/xbox_trace.c).
++   ######################################################################## */
++extern void Xbox_Trace(const char *fmt, ...);
++
++#define PBGL_WAIT_MS 5000u
++
++#define PBGL_BOUNDED_WAIT(cond, tag) do { \
++    unsigned _n = 0; DWORD _t0 = 0; int _timing = 0; \
++    while (cond) { \
++      if ((++_n & 0xFFFFu) == 0) { \
++        if (!_timing) { _t0 = GetTickCount(); _timing = 1; } \
++        else if (GetTickCount() - _t0 > PBGL_WAIT_MS) { \
++          Xbox_Trace("pbgl: wait timeout (%u ms) at %s", PBGL_WAIT_MS, tag); \
++          break; \
++        } \
++      } \
++    } \
++  } while (0)
++
+ // workaround for pbkit enabling the wrong Z buffer mode
+ static inline void pbgl_target_back_buffer(void) {
+-  while (pb_finished());
++  PBGL_BOUNDED_WAIT(pb_finished(), "target_back_buffer/pb_finished");
+   // override Z-buffer mode set by pbkit's set_draw_buffer() for no apparent reason
+   uint32_t *p = pb_begin();
+   p = push_command_parameter(p, NV097_SET_CONTROL0, PBGL_CTRL0);
+@@ -129,7 +154,7 @@ int pbgl_init(int init_pbkit) {
+   }
+   pb_end(p);
+ 
+-  while (pb_busy());
++  PBGL_BOUNDED_WAIT(pb_busy(), "init/combiners");
+ 
+   // init texture manager
+   if (!pbgl_tex_init()) {
+@@ -152,7 +177,7 @@ int pbgl_init(int init_pbkit) {
+   pbgl_state_flush();
+ 
+   // wait for anything that's still happening just in case (probably not necessary)
+-  while (pb_busy());
++  PBGL_BOUNDED_WAIT(pb_busy(), "init/state_flush");
+ 
+   // prepare for drawing the first frame
+   pbgl_target_back_buffer();
+@@ -163,7 +188,7 @@ int pbgl_init(int init_pbkit) {
+   p = push_command_boolean(p, NV097_SET_DEPTH_TEST_ENABLE, pbgl.flags.depth_test);
+   pb_end(p);
+   // wait until everything is done again
+-  while (pb_busy());
++  PBGL_BOUNDED_WAIT(pb_busy(), "init/first_target");
+ 
+   pb_reset();
+ 
+@@ -194,7 +219,7 @@ void pbgl_swap_buffers(void) {
+ 
+   // swap buffers
+   pbgl_target_back_buffer();
+-  while (pb_busy());
++  PBGL_BOUNDED_WAIT(pb_busy(), "swap/pb_busy");
+ 
+   pb_reset();
+ }
+@@ -212,7 +237,7 @@ void pbgl_shutdown(void) {
+     return;
+ 
+   if (pbkit_initialized) {
+-    while (pb_busy());
++    PBGL_BOUNDED_WAIT(pb_busy(), "shutdown/pb_busy");
+     // only deinit pbkit if it was us who inited it
+     if (pbkit_do_deinit) {
+       pb_kill();
+diff --git a/src/state.c b/src/state.c
+index eb960e6..325c88a 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -194,6 +194,37 @@ static inline GLuint *flush_texunit(GLuint *p, GLuint i) {
+       enable = NV_TEX_DISABLE;
+     }
+ 
++    /* NOT UPSTREAM pbGL -- Opposing Force X, BUILD.md 72.
++
++       A texture object that exists but never received data still gets its
++       nv.format computed from a zeroed texture_t: the constant bits come out
++       right (DMA channel, border source, and a colour format, since
++       intfmt_gl_to_nv maps GL_RGB/GL_RGBA to SZ_A8B8G8R8) while everything
++       derived from geometry -- DIMENSIONALITY, MIPMAP_LEVELS, BASE_SIZE_U/V/P
++       -- comes out ZERO. Dimensionality 0 is not a legal value, so the NV2A
++       raises an error on NV097_SET_TEXTURE_FORMAT and pbkit halts the machine
++       with "System halted". That is the crash of BUILD.md 72.2, and the value
++       in its dump (0x00003a0a) decodes to exactly this shape.
++
++       Upstream pushes the texture registers with no check that the texture is
++       usable. Refusing to bind it instead costs one comparison and turns a
++       dead console into an untextured polygon plus one line in the log naming
++       the offender. */
++    if (tu->tex && enable != NV_TEX_DISABLE &&
++        (!tu->tex->allocated || !tu->tex->dimensions || !tu->tex->width || !tu->tex->height)) {
++      extern void Xbox_Trace(const char *fmt, ...);
++      static unsigned n;
++      if (n < 8) {
++        n++;
++        Xbox_Trace("pbgl: unidad %u con textura SIN DATOS -- no se programa "
++          "(alloc %u dims %u %ux%u mips %u fmt %08x addr %08x)",
++          i, (unsigned)tu->tex->allocated, tu->tex->dimensions,
++          tu->tex->width, tu->tex->height, tu->tex->mipcount,
++          tu->tex->nv.format, tu->tex->nv.addr);
++      }
++      enable = NV_TEX_DISABLE;
++    }
++
+     const GLuint tidx = i * 64;
+     if (tu->tex && enable != NV_TEX_DISABLE) {
+       // note: we only operate on swizzled textures
+@@ -822,3 +853,83 @@ GL_API void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+   pbgl.view.w = width;
+   pbgl.view.h = height;
+ }
++
++
++/* NOT UPSTREAM pbGL: pbgl_dbg_state */
++/*
++Opposing Force X, BUILD.md 58. Decals issue thousands of healthy-looking
++draws and never touch the framebuffer while every other draw type works, so
++the remaining evidence is the ACTUAL state pbgl holds when each one draws.
++Called from the engine at one decal draw and one known-visible sprite draw;
++the two lines are diffed by eye in the log. Integers only.
++*/
++extern void Xbox_Trace(const char *fmt, ...);
++
++void pbgl_dbg_state(const char *tag) {
++  const texture_t *t0 = pbgl.tex[0].tex;
++
++  Xbox_Trace("glstate %s: flags[at %u bl %u cull %u zt %u st %u tex0 %u], blend %04x/%04x, alpha %04x ref %u",
++    tag,
++    (unsigned)pbgl.flags.alpha_test, (unsigned)pbgl.flags.blend,
++    (unsigned)pbgl.flags.cull_face, (unsigned)pbgl.flags.depth_test,
++    (unsigned)pbgl.flags.stencil_test, (unsigned)pbgl.tex[0].enabled,
++    pbgl.blend.src, pbgl.blend.dst, pbgl.alpha.func, (unsigned)pbgl.alpha.ref);
++
++  Xbox_Trace("glstate %s: depth func %04x mask %u, colormask %08x, texenv %04x, color x1000 %d %d %d %d",
++    tag,
++    pbgl.depth.func, (unsigned)pbgl.depth.writemask, pbgl.colormask.value,
++    pbgl.texenv[0].mode,
++    (int)(pbgl.varray[VARR_COLOR1].value.x * 1000.f),
++    (int)(pbgl.varray[VARR_COLOR1].value.y * 1000.f),
++    (int)(pbgl.varray[VARR_COLOR1].value.z * 1000.f),
++    (int)(pbgl.varray[VARR_COLOR1].value.w * 1000.f));
++
++  if (t0)
++    Xbox_Trace("glstate %s: tex0 fmt %02x %ux%u pal %u mips %u/%u alloc %u",
++      tag, (unsigned)t0->nv.format & 0xFF, t0->width, t0->height,
++      (unsigned)(t0->palette.width != 0 || t0->shared_palette != NULL),
++      t0->mipcount, t0->mipmax, (unsigned)t0->allocated);
++  else
++    Xbox_Trace("glstate %s: tex0 NULL", tag);
++
++  /* BUILD.md 60: is polygon offset really reaching the flush? Live proof:
++     enable flag, factor/units the engine last set, and whether the values
++     are still waiting for a flush (dirty). Integers only. */
++  Xbox_Trace("glstate %s: polyofs en %u factor x1000 %d units x1000 %d dirty %u",
++    tag, (unsigned)pbgl.flags.poly_offset,
++    (int)(pbgl.polyofs.factor * 1000.f), (int)(pbgl.polyofs.units * 1000.f),
++    (unsigned)pbgl.polyofs.dirty);
++
++  /* BUILD.md 61: the 58 dump equalized DECAL and SPRITE and the decals are
++     still invisible, so the killer is in what it did NOT print. The blind
++     spots, made visible:
++     - texture units 1-3: a unit left enabled by an earlier pass (lightmaps)
++       multiplies its stage into the combiner output; if its alpha is 0 the
++       decal dies under SRC_ALPHA in every blend mode.
++     - viewport and both matrices: a bad transform at decal time moves the
++       polygon off screen with perfectly healthy per-draw state.
++     Integers only. */
++  {
++    int i;
++    float mvsum = 0.f, prsum = 0.f;
++    for (i = 0; i < 16; i++) {
++      mvsum += pbgl.mtx[MTX_MODELVIEW].mtx.v[i];
++      prsum += pbgl.mtx[MTX_PROJECTION].mtx.v[i];
++    }
++    Xbox_Trace("glstate %s: units en %u%u%u%u env %04x %04x %04x %04x act sv %d cl %d scis %u",
++      tag,
++      (unsigned)pbgl.tex[0].enabled, (unsigned)pbgl.tex[1].enabled,
++      (unsigned)pbgl.tex[2].enabled, (unsigned)pbgl.tex[3].enabled,
++      pbgl.texenv[0].mode, pbgl.texenv[1].mode,
++      pbgl.texenv[2].mode, pbgl.texenv[3].mode,
++      pbgl.active_tex_sv, pbgl.active_tex_cl,
++      (unsigned)pbgl.flags.scissor_test);
++    Xbox_Trace("glstate %s: view %d %d %dx%d z %d %d, mv id %u sum x1000 %d, pr id %u sum x1000 %d",
++      tag,
++      pbgl.view.x, pbgl.view.y, pbgl.view.w, pbgl.view.h,
++      (int)pbgl.view.znear, (int)pbgl.view.zfar,
++      (unsigned)pbgl.mtx[MTX_MODELVIEW].identity, (int)(mvsum * 1000.f),
++      (unsigned)pbgl.mtx[MTX_PROJECTION].identity, (int)(prsum * 1000.f));
++  }
++
++}
+diff --git a/src/texture.c b/src/texture.c
+index a6ab130..72630af 100644
+--- a/src/texture.c
++++ b/src/texture.c
+@@ -337,6 +337,14 @@ static void tex_mip8(GLubyte *out, const GLubyte *in, GLuint w, GLuint h, const
+   }
+ }
+ 
++/* NOT UPSTREAM pbGL -- Opposing Force X, BUILD.md 41. One texture out of 769
++   (#models/gman/GMan_Shin1.mdl, 32x64 paletted) freezes the whole console
++   here, deterministically, with the same destination format and a quarter of
++   the memory pressure as its neighbours that upload fine. Static reading has
++   run out: every loop in this path is bounded on paper. These traces split
++   the gap by mip level so the log names the step instead of the function. */
++extern void Xbox_Trace(const char *fmt, ...);
++
+ static void tex_build_mips(texture_t *tex, GLubyte *data, const GLboolean in_place) {
+   GLubyte *buf;
+   const GLubyte *in;
+@@ -369,11 +377,15 @@ static void tex_build_mips(texture_t *tex, GLubyte *data, const GLboolean in_pla
+   GLubyte pal[PAL_MAX_WIDTH  * PAL_BYTESPP] __attribute__((aligned(MEM_ALIGNMENT)));
+   if (palnum) pbgl_aligned_copy(pal, palsrc, palnum * PAL_BYTESPP);
+ 
++  /* BUILD.md 45: the per-level traces did their job in section 44 and are
++     gone -- three synchronous disc writes per mip level, twenty-one per
++     texture, was the most expensive instrumentation this port ever had. */
+   for (GLuint level = tex->mipcount; level < tex->mipmax; ++level, ++tex->mipcount) {
+     const GLuint bytespp = tex->bytespp;
+     const GLuint out_pitch = tex->mips[level].pitch;
+     const GLuint out_w = tex->mips[level].width;
+     const GLuint out_h = tex->mips[level].height;
++
+     if (bytespp >= 3) {
+       // scronch down the width
+       tex_mip_width32(buf, tex->mips[level].size << 1, in, bytespp);
+@@ -684,6 +696,31 @@ GL_API void glGenTextures(GLsizei num, GLuint *out) {
+       return;
+     }
+ 
++    /* ######################################################################
++       NOT UPSTREAM pbGL. Opposing Force X, BUILD.md 44.
++
++       realloc is free to move the block, and pbgl.tex[unit].tex is a raw
++       pointer INTO it, set by glBindTexture. Upstream never rebases them,
++       so every currently bound texture unit is left pointing into memory
++       that realloc has just freed. The next glBindTexture writes
++       `pbgl.tex[u].tex->bound = GL_FALSE` straight through that dangling
++       pointer, and glTexImage2D reads the whole texture_t from it.
++
++       It never bites a small scene: the array starts at TEX_ALLOC_STEP
++       (256) and only moves when the texture count crosses a multiple of
++       it. c1a0 crosses 768 in the middle of the G-Man's textures, which is
++       exactly where this port has frozen eight runs in a row.
++       ###################################################################### */
++    if (newtex != textures) {
++      Xbox_Trace("pbgl tex: array moved %p -> %p (cap %u -> %u), rebasing units",
++        (void *)textures, (void *)newtex, tex_cap, tex_cap + step);
++
++      for (GLuint u = 0; u < TEXUNIT_COUNT; ++u) {
++        if (pbgl.tex[u].tex)
++          pbgl.tex[u].tex = newtex + (pbgl.tex[u].tex - textures);
++      }
++    }
++
+     textures = newtex;
+     memset(&textures[tex_cap], 0, step * sizeof(texture_t));
+ 

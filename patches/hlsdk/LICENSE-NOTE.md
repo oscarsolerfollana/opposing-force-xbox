@@ -21,12 +21,24 @@ Valve's SDK terms, not by the GPLv3.
 | `mingw-server-snprintf.patch` | `dlls/CMakeLists.txt` | Guards `-D_snprintf=snprintf` with `if(NOT MINGW)`, mirroring a guard that already exists in `cl_dll/CMakeLists.txt`. Without it the server library does not cross-compile with mingw-w64. |
 | `hlsdk-vcs-info-inline.patch` | `dlls/wscript`, `cl_dll/wscript` | Compiles `game_shared/vcs_info.c` directly into the server and client targets instead of linking it as a separate static library, making the game libraries self-contained. |
 | `hlsdk-nxdk-gamedll.patch` | `wscript`, `dlls/wscript`, `cl_dll/wscript`, `scripts/waifulib/xcompile.py`, `external/nxdk/*` (new) | Adds an `--nxdk` cross-compilation target for the original Xbox, following the same pattern hlsdk already uses for Nintendo Switch and PS Vita. Builds `opfor.dll` + `client.dll` as PE32 i386 with the nxdk toolchain. |
+| `hlsdk-hl-nxdk.patch` | same files, `master` branch | The same `--nxdk` target on hlsdk's **`master`** branch (plain Half-Life) instead of `opfor`. Half-Life base was used to validate the whole console pipeline before switching to Opposing Force, because its assets were already on the console and known good. Builds `hl.dll` + `client.dll`. |
 
-The first two are described in detail in `BUILD.md` §11.1 and §11.4; the nxdk patch in
-§18.
+The first two are described in detail in `BUILD.md` §11.1 and §11.4; the nxdk patches in
+§18 and §24.
 
 > **`hlsdk-nxdk-gamedll.patch` is cumulative and already contains
 > `hlsdk-vcs-info-inline.patch`.** Apply one or the other, not both.
+
+> **`hlsdk-hl-nxdk.patch` and `hlsdk-nxdk-gamedll.patch` are the same work on two
+> different branches.** They are not meant to be applied to the same tree: pick the
+> branch you want to build. §24.0 explains why both exist and how the two are kept as
+> git worktrees sharing one object store.
+
+Both nxdk patches also carry the target's `-march=pentium3 -mno-sse2`, which is not an
+optimisation preference: hlsdk's own `compiler_optimizations.py` appends
+`-march=pentium-m` for every 32-bit x86 target, and a Pentium M has SSE2 while the
+console's Pentium III does not. Without it the game libraries emit instructions the
+hardware cannot execute (`BUILD.md` §24.7).
 
 ## Scope
 

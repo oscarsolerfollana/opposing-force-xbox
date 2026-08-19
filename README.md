@@ -5,65 +5,57 @@ Porting **Half-Life: Opposing Force** to the **original Xbox**, on top of the
 [hlsdk-portable](https://github.com/FWGS/hlsdk-portable).
 
 This repository holds the **engineering log and the local patches**. It contains no
-engine or game code of its own yet, and it contains **no game assets** — see
+engine or game code of its own, and it contains **no game assets** — see
 [Licensing](#licensing).
 
 ---
 
 ## Status
 
-**Phase 1 — PC baseline: complete.**
+**It runs.** Opposing Force boots, plays and is being debugged on real hardware: a
+retail original Xbox, 128 MB, with the game libraries linked statically inside the
+`.xbe`.
 
 | What | Result |
 |---|---|
-| Xash3D FWGS + Opposing Force, Linux **i386** (32-bit) | ✅ playable |
-| Cross-compiled win32 gamedlls (mingw-w64 i686) + official win32 engine | ✅ runs on native Windows |
-| Static gamedll linking (single binary, no `dlopen`) | ❌ abandoned — three separate blockers in the engine's `xshlib` mechanism |
-| **Save/restore by offsets** (`XASH_ALLOW_SAVERESTORE_OFFSETS`) | ✅ **validated empirically** |
+| Half-Life (base game) on the console | ✅ playable — menu, maps, NPCs, weapons, decals, sound, controller |
+| **Opposing Force** on the console | ✅ **boots and plays** — intro, campaign maps, combat |
+| Op4 game libraries inside the XBE | ✅ 660 server + 71 client entry points, 0 unresolved |
+| Save/restore | ⚠️ mechanism resolved, not yet exercised end to end |
 
-The save/restore validation is the important one: it is the mechanism a console port
-needs when there is no symbol export table to resolve entity think/touch/use handlers
-against. It was verified on the real Opposing Force campaign — a save written with
-offset tokens, the engine closed, the save reloaded in a fresh process, with zero
-pointer-resolution failures and a verified round-trip of the restored pointers.
-Details in `BUILD.md` §15.
+### How the engine blocker was removed
 
-**Phase 2 — Xbox: toolchain working, game libraries building, engine blocked.**
+Phase 2 was stuck on a real problem: nxdk has no PE loader, so the game `.dll`s could
+not be loaded at runtime. The way out was to stop loading them at all — the game
+libraries are **compiled with nxdk, archived, and linked into the `.xbe`**, with a
+generated table mapping each export name to its symbol so the engine's
+`COM_LoadLibrary`/`COM_GetProcAddress` resolve against memory instead of a filesystem
+(§20, §24). A useful consequence: hlsdk's 660 `EXPORT`-marked think/touch/use handlers
+resolve by name exactly as on Windows, so save/restore needs neither Source-style
+datamaps nor the offset-based scheme validated in Phase 1.
 
-| What | Result |
-|---|---|
-| [nxdk](https://github.com/XboxDev/nxdk) toolchain installed and verified | ✅ sample builds to a valid `.xbe` + ISO |
-| [pbgl](https://github.com/fgsfdsfgs/pbgl) (OpenGL 1.x over pbkit) built | ✅ `libpbgl.lib`, 157 GL symbols |
-| **Op4 game libraries cross-compiled with nxdk** | ✅ **231/231 sources, 0 unresolved symbols** — `opfor.dll` (1.59 MB) and `client.dll` (437 KB), PE32 i386, 660 + 71 exports |
-| Fork [`maximqaxd/xash3d-fwgs_xbox`](https://github.com/maximqaxd/xash3d-fwgs_xbox) | ❌ does not configure — two files its own build references are absent from the repository |
-| Loading those `.dll`s on the Xbox | ❌ **blocked** — nxdk has no PE loader |
+### What the log is actually about
 
-The route is **nxdk**, and the game side of it works: the toolchain is clang targeting
-`i386-pc-windows-msvc`, so the C++ ABI is MSVC's — the same one the original GoldSrc
-gamedlls use. The game libraries compile with a small compatibility layer and no
-modification to any hlsdk source file (`patches/hlsdk/hlsdk-nxdk-gamedll.patch`).
+Most of `BUILD.md` is not build instructions. It is the record of hunting bugs on
+hardware with no debugger, where the only witnesses are a log file written to the disc
+and what appears on a CRT. A few that took the longest:
 
-A useful side effect: the server library exports the 660 `Think`/`Touch`/`Use` handlers
-that hlsdk marks with `EXPORT`, so `COM_FunctionFromName`/`NameForFunction` resolve by
-name exactly as they do on Windows. That means this route needs neither Source-style
-datamaps nor even the offset-based save/restore validated in Phase 1 — §15 becomes a
-safety net rather than a requirement.
+- **Every NPC facing the wrong way**, which turned out to be two `%g`/`%f` format
+  specifiers feeding values into a parser — the same class of bug, in two places,
+  breaking scripted sequences, doors and puzzles across the whole game (§53–54).
+- **Decals invisible for thirteen sections**, chased through the renderer, the GL
+  state, the palette upload and the NV2A's registers, and finally caused by a decal
+  pool the fork had shrunk to 64 entries — smaller than the number of decals the maps
+  place by themselves (§55–§68).
+- **A GPU hang in combat**, decoded from a pbkit register dump down to a texture whose
+  format word described a texture with zero dimensions (§72).
+- Several traps that produce a *silently wrong binary* rather than an error: a
+  packaging step that fed on its own previous output, and a "forced" relink that never
+  actually relinked because waf hashes content and `touch` changes nothing (§62, §72).
 
-**The blocker is in the engine, not the game.** §16 chose nxdk partly on the claim that
-it provides a working `LoadLibraryA`. That claim is wrong: nxdk's `LoadLibraryExA` is a
-stub that always fails, and there is no PE loader anywhere in `nxdk/lib/`. The fork
-compounds this by disabling Xash's own in-memory PE loader on Xbox and relying on that
-stub. The likely way out is to re-enable Xash's `MemoryLoadLibrary` (464 lines, already
-present) and supply the four Win32 calls nxdk lacks. Details and alternatives in §18.6–18.7.
-
-The alternative base, [Half-LifeX](https://github.com/brentdc-nz/Half-LifeX), was
-evaluated and rejected: it requires Visual Studio .NET 2003 plus Microsoft's
-non-distributable Xbox XDK, is built on the older Xash3D 0.99 lineage, carries its own
-11k-line OpenGL-over-D3D8 layer, and would require re-implementing save/restore as
-hand-written Source-style datamaps across the game code. It remains an excellent
-reference for the unsolved problem: fitting in 64 MB of RAM.
-
-Full comparison in `BUILD.md` §16; Phase 2 work in §17 and §18.
+The log is written in Spanish and is deliberately verbose: it records the dead ends as
+carefully as the successes, and it marks in every section what has **not** been
+verified.
 
 ---
 
@@ -71,14 +63,11 @@ Full comparison in `BUILD.md` §16; Phase 2 work in §17 and §18.
 
 ```
 BUILD.md                     the engineering log: every command, every failure, every fix
-patches/engine/              local patches against xash3d-fwgs
+patches/engine/              local patches against xash3d-fwgs (GPLv3)
 patches/hlsdk/               local patches against hlsdk-portable (see LICENSE-NOTE.md)
+patches/pbgl/                local patches against pbgl            (see LICENSE-NOTE.md)
 LICENSE                      GPLv3
 ```
-
-`BUILD.md` is written in Spanish and is deliberately verbose: it records the dead ends
-as carefully as the successes, because most of the value of this kind of work is
-knowing what does *not* work and why.
 
 ---
 
@@ -90,10 +79,10 @@ Everything is in **`BUILD.md`**. In short:
 2. §2–§3 — build the engine and the Opposing Force game libraries, 32-bit.
 3. §6 — copy `valve/` and `gearbox/` from **your own legal copy** of the games.
 4. §7 — launch with `-game gearbox`.
-5. §11 — the local patches and how to reapply them after a `git pull`.
 
-For the Xbox side, §17 covers installing and verifying nxdk and pbgl, and §18 covers
-building the Op4 game libraries with it (`./waf configure --nxdk && ./waf build`).
+For the Xbox side: §17 covers installing and verifying nxdk and pbgl, §18 and §24 cover
+building the game libraries with nxdk and linking them into the `.xbe`, and §21–§22
+cover getting the result onto a console and reading its log back over FTP.
 
 The patches are not upstreamed. §11 explains what each one does and whether it is
 mandatory or only needed for a specific experiment.
@@ -102,7 +91,7 @@ mandatory or only needed for a specific experiment.
 
 ## Licensing
 
-This repository is **dual-provenance on purpose**. Read this before reusing anything.
+This repository is **multi-provenance on purpose**. Read this before reusing anything.
 
 ### The repository itself — GPLv3
 
@@ -112,15 +101,17 @@ the patches under **`patches/engine/`**, which are derived from
 
 ### `patches/hlsdk/` — NOT GPLv3
 
-The patches under **`patches/hlsdk/`** are derived from
-[hlsdk-portable](https://github.com/FWGS/hlsdk-portable), which is a fork of the
-**Half-Life SDK by Valve**. They are governed by that SDK's own license terms, **not**
-by this repository's GPLv3. See
-[`patches/hlsdk/LICENSE-NOTE.md`](patches/hlsdk/LICENSE-NOTE.md) and the
-[upstream LICENSE](https://github.com/FWGS/hlsdk-portable/blob/master/LICENSE).
+Derived from [hlsdk-portable](https://github.com/FWGS/hlsdk-portable), a fork of the
+**Half-Life SDK by Valve**, and governed by that SDK's own terms. See
+[`patches/hlsdk/LICENSE-NOTE.md`](patches/hlsdk/LICENSE-NOTE.md).
 
-Putting the GPLv3 `LICENSE` at the repository root does **not** relicense those files,
-and no such relicensing is claimed or intended.
+### `patches/pbgl/` — MIT
+
+Derived from [pbgl](https://github.com/fgsfdsfgs/pbgl), which is MIT. See
+[`patches/pbgl/LICENSE-NOTE.md`](patches/pbgl/LICENSE-NOTE.md).
+
+Putting the GPLv3 `LICENSE` at the repository root does **not** relicense the hlsdk or
+pbgl patches, and no such relicensing is claimed or intended.
 
 ### Game assets — not here, not ever
 
@@ -141,6 +132,7 @@ Both are available on Steam. `BUILD.md` §6 tells you where to put them.
 
 - [FWGS](https://github.com/FWGS) — Xash3D FWGS and hlsdk-portable
 - [@maximqaxd](https://github.com/maximqaxd) — the in-progress Xbox port of Xash3D FWGS
+  this work builds on
 - [@fgsfdsfgs](https://github.com/fgsfdsfgs) — [pbgl](https://github.com/fgsfdsfgs/pbgl),
   OpenGL 1.x for the Xbox over nxdk/pbkit
 - [XboxDev](https://github.com/XboxDev) — nxdk
